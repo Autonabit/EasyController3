@@ -1,5 +1,8 @@
 #include <stdio.h>
+#include <math.h>
 #include "pico/stdlib.h"
+#include "pico/i2c_slave.h"
+#include "hardware/i2c.h"
 #include "hardware/pwm.h"
 #include "hardware/clocks.h"
 #include "hardware/irq.h"
@@ -10,19 +13,21 @@
 
 // Begin user config section ---------------------------
 
-const bool IDENTIFY_HALLS_ON_BOOT = true;   // If true, controller will initialize the hall table by slowly spinning the motor
+const bool IDENTIFY_HALLS_ON_BOOT = false;   // If true, controller will initialize the hall table by slowly spinning the motor
 const bool IDENTIFY_HALLS_REVERSE = false;  // If true, will initialize the hall table to spin the motor backwards
 
-uint8_t hallToMotor[8] = {255, 255, 255, 255, 255, 255, 255, 255};  // Default hall table. Overwrite this with the output of the hall auto-identification 
-// uint8_t hallToMotor[8] = {255, 2, 0, 1, 4, 3, 5, 255};  // Example hall table
+//uint8_t hallToMotor[8] = {255, 255, 255, 255, 255, 255, 255, 255};  // Default hall table. Overwrite this with the output of the hall auto-identification 
+uint8_t hallToMotor[8] = {255, 4, 0, 5, 2, 3, 1, 255};  // Example hall table
 
 const int THROTTLE_LOW = 600;               // ADC value corresponding to minimum throttle, 0-4095
 const int THROTTLE_HIGH = 2650;             // ADC value corresponding to maximum throttle, 0-4095
 
-const bool CURRENT_CONTROL = true;          // Use current control or duty cycle control
+const bool CURRENT_CONTROL = false;          // Use current control or duty cycle control
 const int PHASE_MAX_CURRENT_MA = 6000;      // If using current control, the maximum phase current allowed
 const int BATTERY_MAX_CURRENT_MA = 3000;    // If using current control, the maximum battery current allowed
 const int CURRENT_CONTROL_LOOP_GAIN = 200;  // Adjusts the speed of the current control loop
+
+const int MAX_MOTOR_CMD = 128
 
 // End user config section -----------------------------
 
@@ -69,9 +74,76 @@ uint motorState = 0;
 int fifo_level = 0;
 uint64_t ticks_since_init = 0;
 
+static const uint I2C_SLAVE_ADDRESS = 0x21;
+static const uint I2C_BAUDRATE = 100000; // 100 kHz
+
+static const uint I2C_SLAVE_SDA_PIN = 2;
+static const uint I2C_SLAVE_SCL_PIN = 3;
+
+typedef struct {
+    float velocity;
+    int32_t throttle;
+    int64_t position;
+    float p;
+} driver_state_t;
+
+static struct
+{
+    union  {
+        driver_state_t driver_state;
+        uint8_t bytes[sizeof(driver_state_t)];
+    } mem;
+    uint8_t mem_address;
+    bool mem_address_written;
+} context;
+
 uint get_halls();
 void writePWM(uint motorState, uint duty, bool synchronous);
 uint8_t read_throttle();
+
+static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
+    switch (event) {
+    case I2C_SLAVE_RECEIVE: // master has written some data
+        if (!context.mem_address_written) {
+            // writes always start with the memory address
+            context.mem_address = i2c_read_byte_raw(i2c);
+            context.mem_address_written = true;
+            printf("mem_address: %d\n", context.mem_address);
+        } else {
+            // save into memory
+            context.mem.bytes[context.mem_address] = i2c_read_byte_raw(i2c);
+            printf("master wrote: %d\n", context.mem.bytes[context.mem_address]);
+            context.mem_address++;
+        }
+        break;
+    case I2C_SLAVE_REQUEST: // master is requesting data
+        // load from memory
+        printf("master read: %d\n", context.mem.bytes[context.mem_address]);
+        i2c_write_byte_raw(i2c, context.mem.bytes[context.mem_address]);
+        context.mem_address++;
+        break;
+    case I2C_SLAVE_FINISH: // master has signalled Stop / Restart
+        printf("I2C_SLAVE_FINISH\n");
+        context.mem_address_written = false;
+        break;
+    default:
+        break;
+    }
+}
+
+static void setup_slave() {
+    gpio_init(I2C_SLAVE_SDA_PIN);
+    gpio_set_function(I2C_SLAVE_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SLAVE_SDA_PIN);
+
+    gpio_init(I2C_SLAVE_SCL_PIN);
+    gpio_set_function(I2C_SLAVE_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SLAVE_SCL_PIN);
+
+    i2c_init(i2c1, I2C_BAUDRATE);
+    // configure I2C0 for slave mode
+    i2c_slave_init(i2c1, I2C_SLAVE_ADDRESS, &i2c_slave_handler);
+}
 
 
 void on_adc_fifo() {
@@ -98,20 +170,26 @@ void on_adc_fifo() {
     }
 
     hall = get_halls();                 // Read the hall sensors
-    motorState = hallToMotor[hall];     // Convert the current hall reading to the desired motor state
+    uint newMotor = hallToMotor[hall];     // Convert the current hall reading to the desired motor state
+    if ((newMotor-1)%6==motorState) {
+        context.mem.driver_state.position += 1;
+        //printf("up\n");
+    } else if ((newMotor+1)%6==motorState) {
+        context.mem.driver_state.position -= 1;
+        //printf("down\n");
+    }
+    motorState = newMotor;
 
-    int throttle = ((adc_throttle - THROTTLE_LOW) * 256) / (THROTTLE_HIGH - THROTTLE_LOW);  // Scale the throttle value read from the ADC
-    throttle = MAX(0, MIN(255, throttle));      // Clamp to 0-255
 
     current_ma = (adc_isense - adc_bias) * CURRENT_SCALING;     // Since the current sensor is bidirectional, subtract the zero-current value and scale
     voltage_mv = adc_vsense * VOLTAGE_SCALING;  // Calculate the bus voltage
 
     if(CURRENT_CONTROL) {
-        int user_current_target_ma = throttle * PHASE_MAX_CURRENT_MA / 256;  // Calculate the user-demanded phase current
+        int user_current_target_ma = context.mem.driver_state.throttle * PHASE_MAX_CURRENT_MA / 256;  // Calculate the user-demanded phase current
         int battery_current_limit_ma = BATTERY_MAX_CURRENT_MA * DUTY_CYCLE_MAX / duty_cycle;  // Calculate the maximum phase current allowed while respecting the battery current limit
         current_target_ma = MIN(user_current_target_ma, battery_current_limit_ma);
 
-        if (throttle == 0)
+        if (context.mem.driver_state.throttle == 0)
         {
             duty_cycle = 0;     // If zero throttle, ignore the current control loop and turn all transistors off
             ticks_since_init = 0;   // Reset the timer since the transistors were turned on
@@ -126,10 +204,13 @@ void on_adc_fifo() {
         writePWM(motorState, (uint)(duty_cycle / 256), do_synchronous);
     }
     else {
-        duty_cycle = throttle * 256;    // Set duty cycle based directly on throttle
+        duty_cycle = abs(context.mem.driver_state.throttle) * 256;    // Set duty cycle based directly on throttle
         bool do_synchronous = true;     // Note, if doing synchronous duty-cycle control, the motor will regen if the throttle decreases. This may regen VERY HARD
-
-        writePWM(motorState, (uint)(duty_cycle / 256), do_synchronous);
+        uint8_t driveState = motorState;
+        if (context.mem.driver_state.throttle < 0)
+            driveState = (motorState +3) % 6;  // If throttle is negative, reverse the motor direction
+        
+        writePWM(driveState, (uint)(duty_cycle / 256), do_synchronous);
     }
 
     gpio_put(FLAG_PIN, 0);
@@ -198,6 +279,7 @@ void writePWM(uint motorState, uint duty, bool synchronous)
     else if(motorState == 5)                    // LOW C, HIGH B
         writePhases(0, duty, 0, 0, complement, 255);
     else                                        // All transistors off
+        //writePhases(0, 0, 0, 255, 255, 255);
         writePhases(0, 0, 0, 0, 0, 0);
 }
 
@@ -237,6 +319,7 @@ void init_hardware() {
         adc_bias += adc_read();
     }
     adc_bias /= ADC_BIAS_OVERSAMPLE;
+    printf("%6d isense bias\n", adc_bias);
 
     adc_set_round_robin(0b111);     // Set ADC to read our three ADC pins one after the other (round robin)
     adc_fifo_setup(true, false, 3, false, false);   // ADC writes into a FIFO buffer, and an interrupt is fired once FIFO reaches 3 samples
@@ -324,18 +407,35 @@ void commutate_open_loop()
     // A useful function to debug electrical problems with the board.
     // This slowly advances the motor commutation without reading hall sensors. The motor should slowly spin
     int state = 0;
+    int dir = 1;
     while(true)
     {
+        if (state == 60)
+        {
+            dir = -dir;
+        }
+        if (state == 0)
+        {
+            dir = 1;
+        }
         writePWM(state % 6, 25, false);
+        gpio_put(LED_PIN, !gpio_get(LED_PIN));
         sleep_ms(50);
-        state++;
+        state += dir;
     }
 }
 
 int main() {
+    sleep_ms(1000);
     init_hardware();
 
-    // commutate_open_loop();   // May be helpful for debugging electrical problems
+    commutate_open_loop();
+    setup_slave();
+
+    context.mem.driver_state.throttle = 0;
+    context.mem.driver_state.p = 2;
+
+    // //commutate_open_loop();   // May be helpful for debugging electrical problems
 
     if(IDENTIFY_HALLS_ON_BOOT)
         identify_halls();
@@ -344,10 +444,48 @@ int main() {
 
     pwm_set_irq_enabled(A_PWM_SLICE, true); // Enables interrupts, starting motor commutation
 
-    while (true) {
-        printf("%6d, %6d, %6d, %6d, %2d, %2d\n", current_ma, current_target_ma, duty_cycle, voltage_mv, hall, motorState);
+    float target = 0;
+    float max_target_delta = 100;
+    absolute_time_t last_time = get_absolute_time();
+    sleep_ms(10);
+    while (true) { 
+
+        max_target_delta = MAX_MOTOR_CMD / context.mem.driver_state.p;
+        absolute_time_t now = get_absolute_time();
+        int64_t delta = absolute_time_diff_us(last_time, now);
+
+        target += context.mem.driver_state.velocity * delta / 1000000;
+        // clamp the target to stop the error from winding up (intergral)
+        if (target > (context.mem.driver_state.position + max_target_delta))
+        {
+            target = context.mem.driver_state.position + max_target_delta;
+        }
+        else if (target < (context.mem.driver_state.position - max_target_delta))
+        {
+            target = context.mem.driver_state.position - max_target_delta;
+        }
+
+        float error = target - context.mem.driver_state.position;
+        int16_t throttle  = error * context.mem.driver_state.p;
+
+        if (error > MAX_MOTOR_CMD)
+        {
+            error = MAX_MOTOR_CMD;
+        }
+        else if (error < -MAX_MOTOR_CMD)
+        {
+            error = -MAX_MOTOR_CMD;
+        }
+
+        last_time = now;
+
+        context.mem.driver_state.throttle = throttle;
+ 
+        //printf("%6d, %6d,\n", stage, throttle);
+        //printf("%6d, %6d, %6d, %6d, %6d, %2d, %2d\n", current_ma, current_target_ma, stage, duty_cycle, voltage_mv, hall, motorState);
         gpio_put(LED_PIN, !gpio_get(LED_PIN));  // Toggle the LED
-        sleep_ms(100);
+        sleep_ms(10);
+        printf("P%d, T%f, E%f, T%d, T%d\n", (int32_t)context.mem.driver_state.position, target, error, throttle, context.mem.driver_state.throttle);
     }
 
     return 0;
