@@ -27,11 +27,11 @@ const int PHASE_MAX_CURRENT_MA = 6000;      // If using current control, the max
 const int BATTERY_MAX_CURRENT_MA = 3000;    // If using current control, the maximum battery current allowed
 const int CURRENT_CONTROL_LOOP_GAIN = 200;  // Adjusts the speed of the current control loop
 
-const int MAX_MOTOR_CMD = 128
+const int MAX_MOTOR_CMD = 128;
 
 // End user config section -----------------------------
 
-const uint LED_PIN = 25;
+const uint LED_PIN =  25;
 const uint AH_PIN = 16;
 const uint AL_PIN = 17;
 const uint BH_PIN = 18;
@@ -80,11 +80,14 @@ static const uint I2C_BAUDRATE = 100000; // 100 kHz
 static const uint I2C_SLAVE_SDA_PIN = 2;
 static const uint I2C_SLAVE_SCL_PIN = 3;
 
+absolute_time_t last_i2c_time = 0;
+
 typedef struct {
     float velocity;
     int32_t throttle;
     int64_t position;
     float p;
+    uint8_t max_throttle;
 } driver_state_t;
 
 static struct
@@ -102,6 +105,7 @@ void writePWM(uint motorState, uint duty, bool synchronous);
 uint8_t read_throttle();
 
 static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
+    last_i2c_time = get_absolute_time();
     switch (event) {
     case I2C_SLAVE_RECEIVE: // master has written some data
         if (!context.mem_address_written) {
@@ -429,11 +433,12 @@ int main() {
     sleep_ms(1000);
     init_hardware();
 
-    commutate_open_loop();
+    //commutate_open_loop();
     setup_slave();
 
-    context.mem.driver_state.throttle = 0;
-    context.mem.driver_state.p = 2;
+    context.mem.driver_state.throttle     = 0;
+    context.mem.driver_state.p            = 2;
+    context.mem.driver_state.max_throttle = 100;
 
     // //commutate_open_loop();   // May be helpful for debugging electrical problems
 
@@ -450,7 +455,7 @@ int main() {
     sleep_ms(10);
     while (true) { 
 
-        max_target_delta = MAX_MOTOR_CMD / context.mem.driver_state.p;
+        max_target_delta = context.mem.driver_state.max_throttle / context.mem.driver_state.p;
         absolute_time_t now = get_absolute_time();
         int64_t delta = absolute_time_diff_us(last_time, now);
 
@@ -468,16 +473,21 @@ int main() {
         float error = target - context.mem.driver_state.position;
         int16_t throttle  = error * context.mem.driver_state.p;
 
-        if (error > MAX_MOTOR_CMD)
+        if (error > context.mem.driver_state.max_throttle)
         {
-            error = MAX_MOTOR_CMD;
+            error = context.mem.driver_state.max_throttle;
         }
-        else if (error < -MAX_MOTOR_CMD)
+        else if (error < -context.mem.driver_state.max_throttle)
         {
-            error = -MAX_MOTOR_CMD;
+            error = -context.mem.driver_state.max_throttle;
         }
 
         last_time = now;
+
+        if (abs(absolute_time_diff_us(last_i2c_time, now)) > 100000) // If the I2C master hasn't communicated in 100ms, stop the motor
+        {
+            throttle = 0;
+        }
 
         context.mem.driver_state.throttle = throttle;
  
