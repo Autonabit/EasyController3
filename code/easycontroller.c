@@ -51,7 +51,7 @@ const uint C_PWM_SLICE = 2;
 
 const uint F_PWM = 16000;   // Desired PWM frequency
 const uint FLAG_PIN = 2;
-const uint HALL_OVERSAMPLE = 8;
+const uint HALL_OVERSAMPLE = 64;
 
 const int DUTY_CYCLE_MAX = 65535;
 const int CURRENT_SCALING = 3.3 / 0.0005 / 20 / 4096 * 1000;
@@ -74,7 +74,7 @@ uint motorState = 0;
 int fifo_level = 0;
 uint64_t ticks_since_init = 0;
 
-static const uint I2C_SLAVE_ADDRESS = 0x21;
+static const uint I2C_SLAVE_ADDRESS = 0x23;
 static const uint I2C_BAUDRATE = 100000; // 100 kHz
 
 static const uint I2C_SLAVE_SDA_PIN = 2;
@@ -112,22 +112,22 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
             // writes always start with the memory address
             context.mem_address = i2c_read_byte_raw(i2c);
             context.mem_address_written = true;
-            printf("mem_address: %d\n", context.mem_address);
+            //printf("mem_address: %d\n", context.mem_address);
         } else {
             // save into memory
             context.mem.bytes[context.mem_address] = i2c_read_byte_raw(i2c);
-            printf("master wrote: %d\n", context.mem.bytes[context.mem_address]);
+            //printf("master wrote: %d\n", context.mem.bytes[context.mem_address]);
             context.mem_address++;
         }
         break;
     case I2C_SLAVE_REQUEST: // master is requesting data
         // load from memory
-        printf("master read: %d\n", context.mem.bytes[context.mem_address]);
+        //printf("master read: %d\n", context.mem.bytes[context.mem_address]);
         i2c_write_byte_raw(i2c, context.mem.bytes[context.mem_address]);
         context.mem_address++;
         break;
     case I2C_SLAVE_FINISH: // master has signalled Stop / Restart
-        printf("I2C_SLAVE_FINISH\n");
+        //printf("I2C_SLAVE_FINISH\n");
         context.mem_address_written = false;
         break;
     default:
@@ -147,6 +147,12 @@ static void setup_slave() {
     i2c_init(i2c1, I2C_BAUDRATE);
     // configure I2C0 for slave mode
     i2c_slave_init(i2c1, I2C_SLAVE_ADDRESS, &i2c_slave_handler);
+}
+
+int mod(int a, int b)
+{
+    int r = a % b;
+    return r < 0 ? r + b : r;
 }
 
 
@@ -174,13 +180,15 @@ void on_adc_fifo() {
     }
 
     hall = get_halls();                 // Read the hall sensors
-    uint newMotor = hallToMotor[hall];     // Convert the current hall reading to the desired motor state
-    if ((newMotor-1)%6==motorState) {
+    int newMotor = hallToMotor[hall];     // Convert the current hall reading to the desired motor state
+    if (mod(newMotor-1, 6)==motorState) {
         context.mem.driver_state.position += 1;
-        //printf("up\n");
-    } else if ((newMotor+1)%6==motorState) {
+    } else if (mod(newMotor+1, 6)==motorState) {
         context.mem.driver_state.position -= 1;
-        //printf("down\n");
+    } else if (newMotor == motorState) {
+        // no movement
+    } else {
+        printf("Hall error %d (%d) (%d) %d\n", newMotor, mod(newMotor-1, 6), mod(newMotor+1, 6), motorState);
     }
     motorState = newMotor;
 
@@ -437,10 +445,10 @@ int main() {
     setup_slave();
 
     context.mem.driver_state.throttle     = 0;
-    context.mem.driver_state.p            = 2;
-    context.mem.driver_state.max_throttle = 100;
+    context.mem.driver_state.p            = 0.5;
+    context.mem.driver_state.max_throttle = 200;
 
-    // //commutate_open_loop();   // May be helpful for debugging electrical problems
+    // commutate_open_loop();   // May be helpful for debugging electrical problems
 
     if(IDENTIFY_HALLS_ON_BOOT)
         identify_halls();
@@ -449,44 +457,38 @@ int main() {
 
     pwm_set_irq_enabled(A_PWM_SLICE, true); // Enables interrupts, starting motor commutation
 
-    float target = 0;
-    float max_target_delta = 100;
+    int64_t target = 0;
+    int64_t max_target_delta = 100;
     absolute_time_t last_time = get_absolute_time();
     sleep_ms(10);
     while (true) { 
+
 
         max_target_delta = context.mem.driver_state.max_throttle / context.mem.driver_state.p;
         absolute_time_t now = get_absolute_time();
         int64_t delta = absolute_time_diff_us(last_time, now);
 
-        target += context.mem.driver_state.velocity * delta / 1000000;
+        target += ((int64_t)context.mem.driver_state.velocity) * delta * 1024 / 1000000;
         // clamp the target to stop the error from winding up (intergral)
-        if (target > (context.mem.driver_state.position + max_target_delta))
+        if ((target / 1024) > (context.mem.driver_state.position + max_target_delta))
         {
-            target = context.mem.driver_state.position + max_target_delta;
+            target = (context.mem.driver_state.position + max_target_delta) * 1024;
         }
-        else if (target < (context.mem.driver_state.position - max_target_delta))
+        else if ((target / 1024) < (context.mem.driver_state.position - max_target_delta))
         {
-            target = context.mem.driver_state.position - max_target_delta;
+            target = (context.mem.driver_state.position - max_target_delta) * 1024;
         }
 
-        float error = target - context.mem.driver_state.position;
-        int16_t throttle  = error * context.mem.driver_state.p;
-
-        if (error > context.mem.driver_state.max_throttle)
-        {
-            error = context.mem.driver_state.max_throttle;
-        }
-        else if (error < -context.mem.driver_state.max_throttle)
-        {
-            error = -context.mem.driver_state.max_throttle;
-        }
+        int32_t error = (target / 1024) - context.mem.driver_state.position;
+        int32_t throttle  = error * context.mem.driver_state.p;
 
         last_time = now;
 
         if (abs(absolute_time_diff_us(last_i2c_time, now)) > 100000) // If the I2C master hasn't communicated in 100ms, stop the motor
         {
             throttle = 0;
+            target = context.mem.driver_state.position * 1024;; // Reset the target to the current position
+            // in future we probably want to apply 100% brake. For now we will do this as there is no way of pushing the robot while the escs are powered.
         }
 
         context.mem.driver_state.throttle = throttle;
@@ -494,8 +496,9 @@ int main() {
         //printf("%6d, %6d,\n", stage, throttle);
         //printf("%6d, %6d, %6d, %6d, %6d, %2d, %2d\n", current_ma, current_target_ma, stage, duty_cycle, voltage_mv, hall, motorState);
         gpio_put(LED_PIN, !gpio_get(LED_PIN));  // Toggle the LED
-        sleep_ms(10);
-        printf("P%d, T%f, E%f, T%d, T%d\n", (int32_t)context.mem.driver_state.position, target, error, throttle, context.mem.driver_state.throttle);
+        //sleep_ms(100);
+        printf("P%d, T%d, E%d, T%d, DT%d\n", (int32_t)context.mem.driver_state.position, (int32_t)(target/1024), error, throttle, delta);
+        sleep_ms(100);
     }
 
     return 0;
