@@ -38,9 +38,9 @@ const uint BH_PIN = 18;
 const uint BL_PIN = 19;
 const uint CH_PIN = 20;
 const uint CL_PIN = 21;
-const uint HALL_1_PIN = 13;
-const uint HALL_2_PIN = 14;
-const uint HALL_3_PIN = 15;
+const uint HALL_1_PIN = 10;
+const uint HALL_2_PIN = 11;
+const uint HALL_3_PIN = 12;
 const uint ISENSE_PIN = 26;
 const uint VSENSE_PIN = 27;
 const uint THROTTLE_PIN = 28;
@@ -49,7 +49,7 @@ const uint A_PWM_SLICE = 0;
 const uint B_PWM_SLICE = 1;
 const uint C_PWM_SLICE = 2;
 
-const uint F_PWM = 16000;   // Desired PWM frequency
+const uint F_PWM = 4000;   // Desired PWM frequency
 const uint FLAG_PIN = 2;
 const uint HALL_OVERSAMPLE = 64;
 
@@ -74,8 +74,11 @@ uint motorState = 0;
 int fifo_level = 0;
 uint64_t ticks_since_init = 0;
 
-static const uint I2C_SLAVE_ADDRESS = 0x23;
+const uint ADDR_LOW_PIN = 4;
+const uint ADDR_HIGH_PIN = 5;
+static const uint I2C_SLAVE_ADDRESS = 0xFF;
 static const uint I2C_BAUDRATE = 100000; // 100 kHz
+uint8_t i2c_slave_addr;
 
 static const uint I2C_SLAVE_SDA_PIN = 2;
 static const uint I2C_SLAVE_SCL_PIN = 3;
@@ -87,7 +90,9 @@ typedef struct {
     int32_t throttle;
     int64_t position;
     float p;
+    float i;
     uint8_t max_throttle;
+    uint32_t bad_halls;
 } driver_state_t;
 
 static struct
@@ -136,6 +141,12 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
 }
 
 static void setup_slave() {
+    if (I2C_SLAVE_ADDRESS == 0xFF) {
+        i2c_slave_addr = 0x20 | gpio_get(ADDR_LOW_PIN) | gpio_get(ADDR_HIGH_PIN)<<1;
+    }else {
+        i2c_slave_addr = I2C_SLAVE_ADDRESS;
+    }
+
     gpio_init(I2C_SLAVE_SDA_PIN);
     gpio_set_function(I2C_SLAVE_SDA_PIN, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SLAVE_SDA_PIN);
@@ -146,7 +157,7 @@ static void setup_slave() {
 
     i2c_init(i2c1, I2C_BAUDRATE);
     // configure I2C0 for slave mode
-    i2c_slave_init(i2c1, I2C_SLAVE_ADDRESS, &i2c_slave_handler);
+    i2c_slave_init(i2c1, i2c_slave_addr, &i2c_slave_handler);
 }
 
 int mod(int a, int b)
@@ -188,42 +199,18 @@ void on_adc_fifo() {
     } else if (newMotor == motorState) {
         // no movement
     } else {
-        printf("Hall error %d (%d) (%d) %d\n", newMotor, mod(newMotor-1, 6), mod(newMotor+1, 6), motorState);
+        context.mem.driver_state.bad_halls++;
+        //printf("Hall error %d (%d) (%d) %d\n", newMotor, mod(newMotor-1, 6), mod(newMotor+1, 6), motorState);
     }
     motorState = newMotor;
 
-
-    current_ma = (adc_isense - adc_bias) * CURRENT_SCALING;     // Since the current sensor is bidirectional, subtract the zero-current value and scale
-    voltage_mv = adc_vsense * VOLTAGE_SCALING;  // Calculate the bus voltage
-
-    if(CURRENT_CONTROL) {
-        int user_current_target_ma = context.mem.driver_state.throttle * PHASE_MAX_CURRENT_MA / 256;  // Calculate the user-demanded phase current
-        int battery_current_limit_ma = BATTERY_MAX_CURRENT_MA * DUTY_CYCLE_MAX / duty_cycle;  // Calculate the maximum phase current allowed while respecting the battery current limit
-        current_target_ma = MIN(user_current_target_ma, battery_current_limit_ma);
-
-        if (context.mem.driver_state.throttle == 0)
-        {
-            duty_cycle = 0;     // If zero throttle, ignore the current control loop and turn all transistors off
-            ticks_since_init = 0;   // Reset the timer since the transistors were turned on
-        }
-        else
-            ticks_since_init++;
-
-        duty_cycle += (current_target_ma - current_ma) / CURRENT_CONTROL_LOOP_GAIN;  // Perform a simple integral controller to adjust the duty cycle
-        duty_cycle = MAX(0, MIN(DUTY_CYCLE_MAX, duty_cycle));   // Clamp the duty cycle
-
-        bool do_synchronous = ticks_since_init > 16000;    // Only enable synchronous switching some time after beginning control loop. This allows control loop to stabilize
-        writePWM(motorState, (uint)(duty_cycle / 256), do_synchronous);
-    }
-    else {
-        duty_cycle = abs(context.mem.driver_state.throttle) * 256;    // Set duty cycle based directly on throttle
-        bool do_synchronous = true;     // Note, if doing synchronous duty-cycle control, the motor will regen if the throttle decreases. This may regen VERY HARD
-        uint8_t driveState = motorState;
-        if (context.mem.driver_state.throttle < 0)
-            driveState = (motorState +3) % 6;  // If throttle is negative, reverse the motor direction
-        
-        writePWM(driveState, (uint)(duty_cycle / 256), do_synchronous);
-    }
+    duty_cycle = abs(context.mem.driver_state.throttle);
+    uint8_t driveState = motorState;
+    if (context.mem.driver_state.throttle < 0)
+        driveState = (motorState +3) % 6;  // If throttle is negative, reverse the motor direction
+    
+    writePWM(driveState, (uint)(duty_cycle), false);
+    
 
     gpio_put(FLAG_PIN, 0);
 }
@@ -311,6 +298,11 @@ void init_hardware() {
     gpio_set_dir(HALL_2_PIN, GPIO_IN);
     gpio_init(HALL_3_PIN);
     gpio_set_dir(HALL_3_PIN, GPIO_IN);
+
+    gpio_init(ADDR_LOW_PIN);
+    gpio_set_dir(ADDR_LOW_PIN, GPIO_IN);
+    gpio_init(ADDR_HIGH_PIN);
+    gpio_set_dir(ADDR_HIGH_PIN, GPIO_IN);
 
     gpio_set_function(AH_PIN, GPIO_FUNC_PWM);   // Set gate control pins as output
     gpio_set_function(AL_PIN, GPIO_FUNC_PWM);
@@ -432,20 +424,24 @@ void commutate_open_loop()
         }
         writePWM(state % 6, 25, false);
         gpio_put(LED_PIN, !gpio_get(LED_PIN));
-        sleep_ms(50);
-        state += dir;
+        sleep_ms(5000);
+        //state += dir;
     }
 }
 
 int main() {
     sleep_ms(1000);
     init_hardware();
-
+    gpio_put(LED_PIN, 1);
+    //sleep_ms(3000);
     //commutate_open_loop();
     setup_slave();
+    gpio_put(LED_PIN, 0);
 
+    context.mem.driver_state.velocity     = 0;
     context.mem.driver_state.throttle     = 0;
-    context.mem.driver_state.p            = 0.5;
+    context.mem.driver_state.p            = 1.0;
+    context.mem.driver_state.i            = 0.5;
     context.mem.driver_state.max_throttle = 200;
 
     // commutate_open_loop();   // May be helpful for debugging electrical problems
@@ -457,48 +453,76 @@ int main() {
 
     pwm_set_irq_enabled(A_PWM_SLICE, true); // Enables interrupts, starting motor commutation
 
-    int64_t target = 0;
+    int64_t target_position = 0;
     int64_t max_target_delta = 100;
     absolute_time_t last_time = get_absolute_time();
     sleep_ms(10);
+    float error_accumulator = 0;
+    
+    absolute_time_t next_report = get_absolute_time();
     while (true) { 
 
-
+        // gpio_put(LED_PIN, !gpio_get(LED_PIN));
         max_target_delta = context.mem.driver_state.max_throttle / context.mem.driver_state.p;
         absolute_time_t now = get_absolute_time();
         int64_t delta = absolute_time_diff_us(last_time, now);
 
-        target += ((int64_t)context.mem.driver_state.velocity) * delta * 1024 / 1000000;
+        target_position += ((int64_t)context.mem.driver_state.velocity) * delta * 1024 / 1000000;
         // clamp the target to stop the error from winding up (intergral)
-        if ((target / 1024) > (context.mem.driver_state.position + max_target_delta))
+        if ((target_position / 1024) > (context.mem.driver_state.position + max_target_delta))
         {
-            target = (context.mem.driver_state.position + max_target_delta) * 1024;
+            target_position = (context.mem.driver_state.position + max_target_delta) * 1024;
         }
-        else if ((target / 1024) < (context.mem.driver_state.position - max_target_delta))
+        else if ((target_position / 1024) < (context.mem.driver_state.position - max_target_delta))
         {
-            target = (context.mem.driver_state.position - max_target_delta) * 1024;
+            target_position = (context.mem.driver_state.position - max_target_delta) * 1024;
         }
 
-        int32_t error = (target / 1024) - context.mem.driver_state.position;
-        int32_t throttle  = error * context.mem.driver_state.p;
+        float error = (target_position / 1024) - context.mem.driver_state.position;
+        error_accumulator += error*delta/1000000;
+
+        float error_limit = abs(error);
+        if (error_accumulator > error_limit)
+        {
+            error_accumulator = error_limit;
+        }
+        else if (error_accumulator < -error_limit)
+        {
+            error_accumulator = -error_limit;
+        }
+
+        int32_t throttle  = error * context.mem.driver_state.p + error_accumulator * context.mem.driver_state.i;
 
         last_time = now;
 
         if (abs(absolute_time_diff_us(last_i2c_time, now)) > 100000) // If the I2C master hasn't communicated in 100ms, stop the motor
         {
             throttle = 0;
-            target = context.mem.driver_state.position * 1024;; // Reset the target to the current position
+            target_position = context.mem.driver_state.position * 1024; // Reset the target_position to the current position
+            gpio_put(LED_PIN, false);
             // in future we probably want to apply 100% brake. For now we will do this as there is no way of pushing the robot while the escs are powered.
+        } else {
+            gpio_put(LED_PIN, true);
         }
 
         context.mem.driver_state.throttle = throttle;
- 
-        //printf("%6d, %6d,\n", stage, throttle);
-        //printf("%6d, %6d, %6d, %6d, %6d, %2d, %2d\n", current_ma, current_target_ma, stage, duty_cycle, voltage_mv, hall, motorState);
-        gpio_put(LED_PIN, !gpio_get(LED_PIN));  // Toggle the LED
-        //sleep_ms(100);
-        printf("P%d, T%d, E%d, T%d, DT%d\n", (int32_t)context.mem.driver_state.position, (int32_t)(target/1024), error, throttle, delta);
-        sleep_ms(100);
+
+        if (next_report < now) {
+            printf("i2c slave addr %d\n", i2c_slave_addr);
+            printf("P%d, T%d, E%.2f, T%d, DT%d, BH%d\n", (int32_t)context.mem.driver_state.position, (int32_t)(target_position/1024), error, throttle, (uint32_t)delta, context.mem.driver_state.bad_halls);
+
+
+            printf("error %f\n", error);
+            printf("accumulated error %f\n", error_accumulator);
+
+            printf("p %f\n", context.mem.driver_state.p);
+            printf("i %f\n", context.mem.driver_state.i);
+            printf("loop rate %fhz\n", 1000000.0 / delta);
+            next_report = now + 0.1e6;
+        }
+        
+
+        sleep_us(100);
     }
 
     return 0;
