@@ -105,6 +105,9 @@ static struct
     bool mem_address_written;
 } context;
 
+int64_t prev_position_duration = 0;
+absolute_time_t prev_position_time = 0;
+
 uint get_halls();
 void writePWM(uint motorState, uint duty, bool synchronous);
 uint8_t read_throttle();
@@ -203,6 +206,9 @@ void on_adc_fifo() {
         //printf("Hall error %d (%d) (%d) %d\n", newMotor, mod(newMotor-1, 6), mod(newMotor+1, 6), motorState);
     }
     motorState = newMotor;
+
+    prev_position_duration = get_absolute_time() - prev_position_time;
+    prev_position_time = get_absolute_time();
 
     duty_cycle = abs(context.mem.driver_state.throttle);
     uint8_t driveState = motorState;
@@ -438,11 +444,13 @@ int main() {
     setup_slave();
     gpio_put(LED_PIN, 0);
 
+    prev_position_time = get_absolute_time();
+
     context.mem.driver_state.velocity     = 0;
     context.mem.driver_state.throttle     = 0;
     context.mem.driver_state.p            = 1.0;
     context.mem.driver_state.i            = 0.5;
-    context.mem.driver_state.max_throttle = 200;
+    context.mem.driver_state.max_throttle = 80;
 
     // commutate_open_loop();   // May be helpful for debugging electrical problems
 
@@ -493,6 +501,13 @@ int main() {
 
         int32_t throttle  = error * context.mem.driver_state.p + error_accumulator * context.mem.driver_state.i;
 
+        int32_t throttle_limit = context.mem.driver_state.max_throttle
+        if (throttle > context.mem.driver_state.max_throttle) {
+            throttle = context.mem.driver_state.max_throttle;
+        } else if (throttle < -context.mem.driver_state.max_throttle) {
+            throttle = -context.mem.driver_state.max_throttle
+        }
+
         last_time = now;
 
         if (abs(absolute_time_diff_us(last_i2c_time, now)) > 100000) // If the I2C master hasn't communicated in 100ms, stop the motor
@@ -514,6 +529,7 @@ int main() {
 
             printf("error %f\n", error);
             printf("accumulated error %f\n", error_accumulator);
+            printf("previous tick duration %f\n", prev_position_duration);
 
             printf("p %f\n", context.mem.driver_state.p);
             printf("i %f\n", context.mem.driver_state.i);
