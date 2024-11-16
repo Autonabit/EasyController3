@@ -207,7 +207,7 @@ void on_adc_fifo() {
     }
     motorState = newMotor;
 
-    prev_position_duration = get_absolute_time() - prev_position_time;
+    prev_position_duration = absolute_time_diff_us(prev_position_time, get_absolute_time());
     prev_position_time = get_absolute_time();
 
     duty_cycle = abs(context.mem.driver_state.throttle);
@@ -530,6 +530,7 @@ int main() {
             printf("error %f\n", error);
             printf("accumulated error %f\n", error_accumulator);
             printf("previous tick duration %f\n", prev_position_duration);
+            printf("current tick duration %f\n", absolute_time_diff_us(prev_position_time, get_absolute_time());
 
             printf("p %f\n", context.mem.driver_state.p);
             printf("i %f\n", context.mem.driver_state.i);
