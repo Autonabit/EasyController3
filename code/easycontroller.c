@@ -205,10 +205,13 @@ void on_adc_fifo() {
         context.mem.driver_state.bad_halls++;
         //printf("Hall error %d (%d) (%d) %d\n", newMotor, mod(newMotor-1, 6), mod(newMotor+1, 6), motorState);
     }
-    motorState = newMotor;
+    
+    if (motorState != newMotor) {
+        prev_position_duration = absolute_time_diff_us(prev_position_time, get_absolute_time());
+        prev_position_time = get_absolute_time();
+    }
 
-    prev_position_duration = absolute_time_diff_us(prev_position_time, get_absolute_time());
-    prev_position_time = get_absolute_time();
+    motorState = newMotor;
 
     duty_cycle = abs(context.mem.driver_state.throttle);
     uint8_t driveState = motorState;
@@ -501,11 +504,14 @@ int main() {
 
         int32_t throttle  = error * context.mem.driver_state.p + error_accumulator * context.mem.driver_state.i;
 
-        int32_t throttle_limit = context.mem.driver_state.max_throttle
-        if (throttle > context.mem.driver_state.max_throttle) {
-            throttle = context.mem.driver_state.max_throttle;
-        } else if (throttle < -context.mem.driver_state.max_throttle) {
-            throttle = -context.mem.driver_state.max_throttle
+        // Velocity based throttle limiting
+        int64_t current_position_duration = absolute_time_diff_us(prev_position_time, get_absolute_time());
+        int64_t duration = current_position_duration > prev_position_duration ? current_position_duration : prev_position_duration;
+        int32_t throttle_limit = 60.0 + 60.0/300.0 * (1e6f / (float)duration /*tps*/); /* 60 at 0tps, 100 at >= 300 tps*/
+        if (throttle > throttle_limit) {
+            throttle = throttle_limit;
+        } else if (throttle < -throttle_limit) {
+            throttle = -throttle_limit;
         }
 
         last_time = now;
@@ -523,14 +529,20 @@ int main() {
         context.mem.driver_state.throttle = throttle;
 
         if (next_report < now) {
-            printf("i2c slave addr %d\n", i2c_slave_addr);
-            printf("P%d, T%d, E%.2f, T%d, DT%d, BH%d\n", (int32_t)context.mem.driver_state.position, (int32_t)(target_position/1024), error, throttle, (uint32_t)delta, context.mem.driver_state.bad_halls);
+            //printf("i2c slave addr %d\n", i2c_slave_addr);
+            // printf("P%d, T%d, E%.2f, T%d, DT%d, BH%d\n", (int32_t)context.mem.driver_state.position, (int32_t)(target_position/1024), error, throttle, (uint32_t)delta, context.mem.driver_state.bad_halls);
 
-
+            printf("\n\n");
             printf("error %f\n", error);
             printf("accumulated error %f\n", error_accumulator);
-            printf("previous tick duration %f\n", prev_position_duration);
-            printf("current tick duration %f\n", absolute_time_diff_us(prev_position_time, get_absolute_time());
+            printf("current time %lld\n", get_absolute_time());
+            printf("previous tick %lld\n", prev_position_time);
+            printf("previous tick duration %lld\n", prev_position_duration);
+            printf("current duration %lld\n", duration);
+            printf("ticks per second %f\n", 1e6f / (float)duration);
+            printf("throttle limit %d\n", throttle_limit);
+            printf("throttle %d\n", throttle);
+            printf("current tick duration %lld\n", absolute_time_diff_us(prev_position_time, get_absolute_time()));
 
             printf("p %f\n", context.mem.driver_state.p);
             printf("i %f\n", context.mem.driver_state.i);
