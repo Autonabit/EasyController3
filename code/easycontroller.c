@@ -11,6 +11,11 @@
 #include "hardware/sync.h"
 #include "hardware/uart.h"
 
+#define VERSION 2
+#define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
+#define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
+#define AIRCR_Register (*((volatile uint32_t*)(PPB_BASE + 0x0ED0C)))
+
 // Begin user config section ---------------------------
 
 const bool IDENTIFY_HALLS_ON_BOOT = false;   // If true, controller will initialize the hall table by slowly spinning the motor
@@ -18,14 +23,8 @@ const bool IDENTIFY_HALLS_REVERSE = false;  // If true, will initialize the hall
 
 //uint8_t hallToMotor[8] = {255, 255, 255, 255, 255, 255, 255, 255};  // Default hall table. Overwrite this with the output of the hall auto-identification 
 uint8_t hallToMotor[8] = {255, 4, 0, 5, 2, 3, 1, 255};  // Example hall table
+// uint8_t hallToMotor[8] = {255, 1, 3, 2, 5, 0, 4, 255,}; 
 
-const int THROTTLE_LOW = 600;               // ADC value corresponding to minimum throttle, 0-4095
-const int THROTTLE_HIGH = 2650;             // ADC value corresponding to maximum throttle, 0-4095
-
-const bool CURRENT_CONTROL = false;          // Use current control or duty cycle control
-const int PHASE_MAX_CURRENT_MA = 6000;      // If using current control, the maximum phase current allowed
-const int BATTERY_MAX_CURRENT_MA = 3000;    // If using current control, the maximum battery current allowed
-const int CURRENT_CONTROL_LOOP_GAIN = 200;  // Adjusts the speed of the current control loop
 
 const int MAX_MOTOR_CMD = 128;
 
@@ -49,7 +48,7 @@ const uint A_PWM_SLICE = 0;
 const uint B_PWM_SLICE = 1;
 const uint C_PWM_SLICE = 2;
 
-const uint F_PWM = 4000;   // Desired PWM frequency
+const uint F_PWM = 16000;   // Desired PWM frequency
 const uint FLAG_PIN = 2;
 const uint HALL_OVERSAMPLE = 64;
 
@@ -86,14 +85,15 @@ static const uint I2C_SLAVE_SCL_PIN = 3;
 absolute_time_t last_i2c_time = 0;
 
 typedef struct {
-    float velocity;
-    int32_t throttle;
+    int16_t throttle;
+    uint8_t brake;
+    int32_t tps;
     int64_t position;
-    float p;
-    float i;
-    uint8_t max_throttle;
     uint32_t bad_halls;
-} driver_state_t;
+    uint8_t version;
+    uint8_t reset;
+    uint16_t filter; // * 0.01
+} __attribute__((packed)) driver_state_t;
 
 static struct
 {
@@ -105,8 +105,13 @@ static struct
     bool mem_address_written;
 } context;
 
-int64_t prev_position_duration = 0;
-absolute_time_t prev_position_time = 0;
+typedef struct
+{
+    int64_t position;
+    absolute_time_t time;
+} motor_position_t;
+
+motor_position_t motor_positions[3]; 
 
 uint get_halls();
 void writePWM(uint motorState, uint duty, bool synchronous);
@@ -207,18 +212,24 @@ void on_adc_fifo() {
     }
     
     if (motorState != newMotor) {
-        prev_position_duration = absolute_time_diff_us(prev_position_time, get_absolute_time());
-        prev_position_time = get_absolute_time();
+        if ( context.mem.driver_state.position != motor_positions[1].position) {
+            motor_positions[2] = motor_positions[1];
+            motor_positions[1] = motor_positions[0];
+            motor_positions[0] = (motor_position_t){.position = context.mem.driver_state.position, .time = get_absolute_time()};
+        }
     }
-
+   
     motorState = newMotor;
-
-    duty_cycle = abs(context.mem.driver_state.throttle);
-    uint8_t driveState = motorState;
-    if (context.mem.driver_state.throttle < 0)
-        driveState = (motorState +3) % 6;  // If throttle is negative, reverse the motor direction
-    
-    writePWM(driveState, (uint)(duty_cycle), false);
+    if (context.mem.driver_state.brake > 0) {
+        writePWM(7, context.mem.driver_state.brake, true);
+    } else {
+        duty_cycle = abs(context.mem.driver_state.throttle);
+        uint8_t driveState = motorState;
+        if (context.mem.driver_state.throttle < 0)
+            driveState = (motorState +3) % 6;  // If throttle is negative, reverse the motor direction
+        
+        writePWM(driveState, (uint)(duty_cycle), true);
+    }
     
 
     gpio_put(FLAG_PIN, 0);
@@ -288,7 +299,7 @@ void writePWM(uint motorState, uint duty, bool synchronous)
         writePhases(0, duty, 0, 0, complement, 255);
     else                                        // All transistors off
         //writePhases(0, 0, 0, 255, 255, 255);
-        writePhases(0, 0, 0, 0, 0, 0);
+        writePhases(0, 0, 0, duty, duty, duty);
 }
 
 void init_hardware() {
@@ -390,14 +401,14 @@ void identify_halls()
     // This commutates to all half-states and reads the corresponding hall value. Then, since electrical position
     // should lead rotor position by 90 degrees, for this hall state, save a motor state 1.5 steps ahead.
 
-    sleep_ms(2000);
+    sleep_ms(500);
     for(uint i = 0; i < 6; i++)
     {
-        for(uint j = 0; j < 1000; j++)       // Commutate to a half-state long enough to allow the rotor to stop moving
+        for(uint j = 0; j < 500; j++)       // Commutate to a half-state long enough to allow the rotor to stop moving
         {
-            sleep_us(500);
+            sleep_us(1000);
             writePWM(i, HALL_IDENTIFY_DUTY_CYCLE, false);
-            sleep_us(500);
+            sleep_us(1000);
             writePWM((i + 1) % 6, HALL_IDENTIFY_DUTY_CYCLE, false);     // PWM to the next half-state
         }
 
@@ -439,28 +450,23 @@ void commutate_open_loop()
 }
 
 int main() {
-    sleep_ms(1000);
+    context.mem.driver_state.version = VERSION;
+
+    sleep_ms(500);
     init_hardware();
     gpio_put(LED_PIN, 1);
-    //sleep_ms(3000);
-    //commutate_open_loop();
+    sleep_ms(500);
+    // commutate_open_loop();
     setup_slave();
     gpio_put(LED_PIN, 0);
 
-    prev_position_time = get_absolute_time();
-
-    context.mem.driver_state.velocity     = 0;
-    context.mem.driver_state.throttle     = 0;
-    context.mem.driver_state.p            = 1.0;
-    context.mem.driver_state.i            = 0.5;
-    context.mem.driver_state.max_throttle = 80;
+    // context.mem.driver_state.throttle     = -5;
 
     // commutate_open_loop();   // May be helpful for debugging electrical problems
 
     if(IDENTIFY_HALLS_ON_BOOT)
         identify_halls();
 
-    sleep_ms(1000);
 
     pwm_set_irq_enabled(A_PWM_SLICE, true); // Enables interrupts, starting motor commutation
 
@@ -471,87 +477,81 @@ int main() {
     float error_accumulator = 0;
     
     absolute_time_t next_report = get_absolute_time();
-    while (true) { 
 
-        // gpio_put(LED_PIN, !gpio_get(LED_PIN));
-        max_target_delta = context.mem.driver_state.max_throttle / context.mem.driver_state.p;
+    float tps_expo_avg = 0.0;
+    context.mem.driver_state.filter       = 100;
+    context.mem.driver_state.brake        = 0;
+    
+
+    while (true) { 
+        if (context.mem.driver_state.reset > 0) {
+            AIRCR_Register = 0x5FA0004;
+        }
         absolute_time_t now = get_absolute_time();
         int64_t delta = absolute_time_diff_us(last_time, now);
 
-        target_position += ((int64_t)context.mem.driver_state.velocity) * delta * 1024 / 1000000;
-        // clamp the target to stop the error from winding up (intergral)
-        if ((target_position / 1024) > (context.mem.driver_state.position + max_target_delta))
-        {
-            target_position = (context.mem.driver_state.position + max_target_delta) * 1024;
-        }
-        else if ((target_position / 1024) < (context.mem.driver_state.position - max_target_delta))
-        {
-            target_position = (context.mem.driver_state.position - max_target_delta) * 1024;
-        }
-
-        float error = (target_position / 1024) - context.mem.driver_state.position;
-        error_accumulator += error*delta/1000000;
-
-        float error_limit = abs(error);
-        if (error_accumulator > error_limit)
-        {
-            error_accumulator = error_limit;
-        }
-        else if (error_accumulator < -error_limit)
-        {
-            error_accumulator = -error_limit;
-        }
-
-        int32_t throttle  = error * context.mem.driver_state.p + error_accumulator * context.mem.driver_state.i;
+        float delta_s = (float)delta / 1e6;
 
         // Velocity based throttle limiting
-        int64_t current_position_duration = absolute_time_diff_us(prev_position_time, get_absolute_time());
+        int64_t current_position_duration = absolute_time_diff_us(motor_positions[0].time, get_absolute_time());
+        int64_t prev_position_duration = absolute_time_diff_us(motor_positions[1].time, motor_positions[0].time);
         int64_t duration = current_position_duration > prev_position_duration ? current_position_duration : prev_position_duration;
         int32_t throttle_limit = 60.0 + 60.0/300.0 * (1e6f / (float)duration /*tps*/); /* 60 at 0tps, 100 at >= 300 tps*/
-        if (throttle > throttle_limit) {
-            throttle = throttle_limit;
-        } else if (throttle < -throttle_limit) {
-            throttle = -throttle_limit;
+        
+        float filter_ratio = context.mem.driver_state.filter * delta_s / 100.f; 
+        if (motor_positions[0].position > motor_positions[1].position) {
+            tps_expo_avg = 1e6f / duration * filter_ratio + tps_expo_avg * (1 - filter_ratio);
         }
+        else {
+            tps_expo_avg = -1e6f / duration * filter_ratio + tps_expo_avg * (1 - filter_ratio);
+        }
+        context.mem.driver_state.tps = (int32_t)(tps_expo_avg*100);
+        
 
         last_time = now;
-
-        if (abs(absolute_time_diff_us(last_i2c_time, now)) > 100000) // If the I2C master hasn't communicated in 100ms, stop the motor
+        // last_i2c_time = now;
+        if (abs(absolute_time_diff_us(last_i2c_time, now)) > 600e6) // If the I2C master hasn't communicated in 10mins, reset the controller
         {
-            throttle = 0;
-            target_position = context.mem.driver_state.position * 1024; // Reset the target_position to the current position
+            context.mem.driver_state.reset = 1;
+        } else if (abs(absolute_time_diff_us(last_i2c_time, now)) > 100000) // If the I2C master hasn't communicated in 100ms, stop the motor
+        {
+            context.mem.driver_state.throttle = 0;
+            context.mem.driver_state.brake = 0; //abs((int)tps_expo_avg*2) < 255 ? abs((int)tps_expo_avg*2) : 255;
             gpio_put(LED_PIN, false);
             // in future we probably want to apply 100% brake. For now we will do this as there is no way of pushing the robot while the escs are powered.
         } else {
             gpio_put(LED_PIN, true);
         }
 
-        context.mem.driver_state.throttle = throttle;
+
 
         if (next_report < now) {
             //printf("i2c slave addr %d\n", i2c_slave_addr);
             // printf("P%d, T%d, E%.2f, T%d, DT%d, BH%d\n", (int32_t)context.mem.driver_state.position, (int32_t)(target_position/1024), error, throttle, (uint32_t)delta, context.mem.driver_state.bad_halls);
 
             printf("\n\n");
-            printf("error %f\n", error);
-            printf("accumulated error %f\n", error_accumulator);
             printf("current time %lld\n", get_absolute_time());
-            printf("previous tick %lld\n", prev_position_time);
+            printf("throttle %d\n", context.mem.driver_state.throttle);
+            printf("brake %d\n", context.mem.driver_state.brake);
             printf("previous tick duration %lld\n", prev_position_duration);
             printf("current duration %lld\n", duration);
             printf("ticks per second %f\n", 1e6f / (float)duration);
+            printf("tps filter %f\n", tps_expo_avg);
+            printf("delta   %lld\n", delta);
+            printf("delta s %f\n", delta_s);
             printf("throttle limit %d\n", throttle_limit);
-            printf("throttle %d\n", throttle);
-            printf("current tick duration %lld\n", absolute_time_diff_us(prev_position_time, get_absolute_time()));
+            printf("filter_ratio limit %f\n", filter_ratio);
+            printf("current tick duration %lld\n", current_position_duration);
+            printf("memstate size %d\n", sizeof(driver_state_t));
 
-            printf("p %f\n", context.mem.driver_state.p);
-            printf("i %f\n", context.mem.driver_state.i);
+            printf("position %lld %lld %lld\n", motor_positions[0].position, motor_positions[1].position,  motor_positions[2].position);
+
             printf("loop rate %fhz\n", 1000000.0 / delta);
-            next_report = now + 0.1e6;
+            next_report = now + 0.5e6;
         }
         
 
-        sleep_us(100);
+        sleep_ms(10);
     }
 
     return 0;
