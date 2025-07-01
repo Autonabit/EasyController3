@@ -11,7 +11,7 @@
 #include "hardware/sync.h"
 #include "hardware/uart.h"
 
-#define VERSION 2
+#define VERSION 3
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
 #define AIRCR_Register (*((volatile uint32_t*)(PPB_BASE + 0x0ED0C)))
@@ -53,7 +53,8 @@ const uint FLAG_PIN = 2;
 const uint HALL_OVERSAMPLE = 64;
 
 const int DUTY_CYCLE_MAX = 65535;
-const int CURRENT_SCALING = 3.3 / 0.0005 / 20 / 4096 * 1000;
+// 100mV / Amp sensor with a 2/3 voltage divider (15 amp / volt)
+const int CURRENT_SCALING = 3.3 / 4096 * ( -10 * 3 / 2 ) * 1000; 
 const int VOLTAGE_SCALING = 3.3 / 4096 * (47 + 2.2) / 2.2 * 1000;
 const int ADC_BIAS_OVERSAMPLE = 1000;
 
@@ -62,12 +63,13 @@ const int HALL_IDENTIFY_DUTY_CYCLE = 25;
 int adc_isense = 0;
 int adc_vsense = 0;
 int adc_throttle = 0;
+int64_t adc_isense_sum = 0;
+uint16_t adc_isense_count = 0;
 
 int adc_bias = 0;
 int duty_cycle = 0;
 int voltage_mv = 0;
 int current_ma = 0;
-int current_target_ma = 0;
 int hall = 0;
 uint motorState = 0;
 int fifo_level = 0;
@@ -93,6 +95,10 @@ typedef struct {
     uint8_t version;
     uint8_t reset;
     uint16_t filter; // * 0.01
+    int32_t current_ma;
+    int32_t voltage_mv;
+    int32_t current_limit_ma;
+    float throttle_limit;      // controllers calculated limit to manage over current
 } __attribute__((packed)) driver_state_t;
 
 static struct
@@ -198,12 +204,28 @@ void on_adc_fifo() {
         return;
     }
 
+    
+
+    voltage_mv = (int)(adc_vsense) * VOLTAGE_SCALING;
+    current_ma = ((int)(adc_isense) - adc_bias);
+
+    context.mem.driver_state.voltage_mv = voltage_mv;
+
+    // The current adc is noisy, so we average over 8000 samples and then through away half of the samples... repeat
+    adc_isense_sum += adc_isense - adc_bias;
+    adc_isense_count++;
+    if (adc_isense_count > 8000) {
+        context.mem.driver_state.current_ma = adc_isense_sum / adc_isense_count * CURRENT_SCALING; 
+        adc_isense_sum *= 0.5;
+        adc_isense_count *= 0.5;
+    }
+
     hall = get_halls();                 // Read the hall sensors
     int newMotor = hallToMotor[hall];     // Convert the current hall reading to the desired motor state
     if (mod(newMotor-1, 6)==motorState) {
-        context.mem.driver_state.position += 1;
-    } else if (mod(newMotor+1, 6)==motorState) {
         context.mem.driver_state.position -= 1;
+    } else if (mod(newMotor+1, 6)==motorState) {
+        context.mem.driver_state.position += 1;
     } else if (newMotor == motorState) {
         // no movement
     } else {
@@ -224,6 +246,9 @@ void on_adc_fifo() {
         writePWM(7, context.mem.driver_state.brake, true);
     } else {
         duty_cycle = abs(context.mem.driver_state.throttle);
+        if (duty_cycle > context.mem.driver_state.throttle_limit) {
+            duty_cycle = context.mem.driver_state.throttle_limit; // Clamp the duty cycle to the throttle limit
+        }
         uint8_t driveState = motorState;
         if (context.mem.driver_state.throttle < 0)
             driveState = (motorState +3) % 6;  // If throttle is negative, reverse the motor direction
@@ -479,9 +504,11 @@ int main() {
     absolute_time_t next_report = get_absolute_time();
 
     float tps_expo_avg = 0.0;
-    context.mem.driver_state.filter       = 100;
-    context.mem.driver_state.brake        = 0;
-    
+    context.mem.driver_state.filter           = 100;
+    context.mem.driver_state.brake            = 0;
+    context.mem.driver_state.throttle         = 0;
+    context.mem.driver_state.current_limit_ma = 5000; // Set a default current limit of 5A
+    context.mem.driver_state.throttle_limit   = 255;
 
     while (true) { 
         if (context.mem.driver_state.reset > 0) {
@@ -496,7 +523,7 @@ int main() {
         int64_t current_position_duration = absolute_time_diff_us(motor_positions[0].time, get_absolute_time());
         int64_t prev_position_duration = absolute_time_diff_us(motor_positions[1].time, motor_positions[0].time);
         int64_t duration = current_position_duration > prev_position_duration ? current_position_duration : prev_position_duration;
-        int32_t throttle_limit = 60.0 + 60.0/300.0 * (1e6f / (float)duration /*tps*/); /* 60 at 0tps, 100 at >= 300 tps*/
+
         
         float filter_ratio = context.mem.driver_state.filter * delta_s / 100.f; 
         if (motor_positions[0].position > motor_positions[1].position) {
@@ -506,6 +533,12 @@ int main() {
             tps_expo_avg = -1e6f / duration * filter_ratio + tps_expo_avg * (1 - filter_ratio);
         }
         context.mem.driver_state.tps = (int32_t)(tps_expo_avg*100);
+
+        if (context.mem.driver_state.current_ma > context.mem.driver_state.current_limit_ma) {
+            context.mem.driver_state.throttle_limit = MIN(abs(context.mem.driver_state.throttle), context.mem.driver_state.throttle_limit * 0.999f);
+        } else if (context.mem.driver_state.throttle_limit < 255) {
+            context.mem.driver_state.throttle_limit += 0.1;
+        }
         
 
         last_time = now;
@@ -529,24 +562,27 @@ int main() {
             //printf("i2c slave addr %d\n", i2c_slave_addr);
             // printf("P%d, T%d, E%.2f, T%d, DT%d, BH%d\n", (int32_t)context.mem.driver_state.position, (int32_t)(target_position/1024), error, throttle, (uint32_t)delta, context.mem.driver_state.bad_halls);
 
-            printf("\n\n");
-            printf("current time %lld\n", get_absolute_time());
-            printf("throttle %d\n", context.mem.driver_state.throttle);
-            printf("brake %d\n", context.mem.driver_state.brake);
-            printf("previous tick duration %lld\n", prev_position_duration);
-            printf("current duration %lld\n", duration);
-            printf("ticks per second %f\n", 1e6f / (float)duration);
-            printf("tps filter %f\n", tps_expo_avg);
-            printf("delta   %lld\n", delta);
-            printf("delta s %f\n", delta_s);
-            printf("throttle limit %d\n", throttle_limit);
-            printf("filter_ratio limit %f\n", filter_ratio);
-            printf("current tick duration %lld\n", current_position_duration);
-            printf("memstate size %d\n", sizeof(driver_state_t));
+            // printf("\n\n");
+            // printf("current time %lld\n", get_absolute_time());
+            // printf("voltage (mv) %d\n", context.mem.driver_state.voltage_mv);
+            // printf("current (ma) %d\n", context.mem.driver_state.current_ma);
+            // printf("adc bias %d\n", adc_bias);
+            // printf("throttle %d\n", context.mem.driver_state.throttle);
+            // printf("brake %d\n", context.mem.driver_state.brake);
+            // printf("previous tick duration %lld\n", prev_position_duration);
+            // printf("current duration %lld\n", duration);
+            // printf("ticks per second %f\n", 1e6f / (float)duration);
+            // printf("tps filter %f\n", tps_expo_avg);
+            // printf("delta   %lld\n", delta);
+            // printf("delta s %f\n", delta_s);
+            // printf("throttle limit %f\n", context.mem.driver_state.throttle_limit);
+            // printf("filter_ratio limit %f\n", filter_ratio);
+            // printf("current tick duration %lld\n", current_position_duration);
+            // printf("memstate size %d\n", sizeof(driver_state_t));
 
-            printf("position %lld %lld %lld\n", motor_positions[0].position, motor_positions[1].position,  motor_positions[2].position);
+            // printf("position %lld %lld %lld\n", motor_positions[0].position, motor_positions[1].position,  motor_positions[2].position);
 
-            printf("loop rate %fhz\n", 1000000.0 / delta);
+            // printf("loop rate %fhz\n", 1000000.0 / delta);
             next_report = now + 0.5e6;
         }
         
