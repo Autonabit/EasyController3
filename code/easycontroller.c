@@ -48,7 +48,7 @@ const uint A_PWM_SLICE = 0;
 const uint B_PWM_SLICE = 1;
 const uint C_PWM_SLICE = 2;
 
-const uint F_PWM = 16000;   // Desired PWM frequency
+const uint F_PWM = 2000;   // Desired PWM frequency
 const uint FLAG_PIN = 2;
 const uint HALL_OVERSAMPLE = 64;
 
@@ -212,13 +212,13 @@ void on_adc_fifo() {
 
     context.mem.driver_state.voltage_mv = voltage_mv;
 
-    // The current adc is noisy, so we average over 8000 samples and then through away half of the samples... repeat
+    // The current adc is noisy, so we average over 100ms
     adc_isense_sum += adc_isense - adc_bias;
     adc_isense_count++;
-    if (adc_isense_count > 8000) {
+    if (adc_isense_count > (F_PWM / 10)) { // Average over 100ms
         context.mem.driver_state.current_ma = adc_isense_sum / adc_isense_count * CURRENT_SCALING; 
-        adc_isense_sum *= 0.5;
-        adc_isense_count *= 0.5;
+        adc_isense_sum = 0;
+        adc_isense_count = 0;
     }
 
     hall = get_halls();                 // Read the hall sensors
@@ -479,11 +479,24 @@ int main() {
 
     sleep_ms(500);
     init_hardware();
-    gpio_put(LED_PIN, 1);
     sleep_ms(500);
     // commutate_open_loop();
     setup_slave();
+
+    gpio_put(LED_PIN, 1);
+    sleep_ms(500);
     gpio_put(LED_PIN, 0);
+    sleep_ms(500);
+
+    int blink_count =  i2c_slave_addr & 3;
+    while (blink_count)
+    {
+        gpio_put(LED_PIN, 1);
+        sleep_ms(250);
+        gpio_put(LED_PIN, 0);
+        sleep_ms(250);
+        blink_count--;
+    }
 
     // context.mem.driver_state.throttle     = -5;
 
@@ -504,7 +517,7 @@ int main() {
     absolute_time_t next_report = get_absolute_time();
 
     float tps_expo_avg = 0.0;
-    context.mem.driver_state.filter           = 200;
+    context.mem.driver_state.filter           = 1500;
     context.mem.driver_state.brake            = 0;
     context.mem.driver_state.throttle         = 0;
     context.mem.driver_state.current_limit_ma = 5000; // Set a default current limit of 5A
@@ -525,23 +538,39 @@ int main() {
         pos_snapshot[0] = motor_positions[0];
         pos_snapshot[1] = motor_positions[1];
         restore_interrupts(flags);
-        
-        // Calculate velocity using time difference between position updates
-        int64_t position_delta = pos_snapshot[0].position - pos_snapshot[1].position;
-        int64_t time_delta_us = absolute_time_diff_us(pos_snapshot[1].time, pos_snapshot[0].time);
-        int64_t current_position_time_us = absolute_time_diff_us(pos_snapshot[0].time, now);
-        
-        // Only update velocity if we have valid data
-        float filter_ratio = context.mem.driver_state.filter * delta_s;
+               
+        // --- compute instantaneous_tps safely ---
+        int64_t position_delta      = pos_snapshot[0].position - pos_snapshot[1].position;
+        int64_t dt_us_between_ticks = absolute_time_diff_us(pos_snapshot[1].time, pos_snapshot[0].time);
+        int64_t age_us_since_last   = absolute_time_diff_us(pos_snapshot[0].time, now);
 
-        int64_t effective_time_us = current_position_time_us > time_delta_us ? current_position_time_us : time_delta_us;
-        
-        float instantaneous_tps = (float)position_delta * 1e6f / (float)effective_time_us;
-        tps_expo_avg = instantaneous_tps * filter_ratio + tps_expo_avg * (1 - filter_ratio);
+        // Treat data as stale if it's too old compared to the last tick period
+        // or if it exceeds a hard ceiling (e.g., 200 ms).
+        const int64_t STALE_MULT   = 3;        // x of last tick period
+        const int64_t STALE_ABS_US = 200000;   // 200 ms absolute timeout
 
-        
-        // Atomic update of tps to prevent I2C read race condition
-        context.mem.driver_state.tps = (int32_t)(tps_expo_avg * 100);;
+        bool stale = (dt_us_between_ticks == 0) ||
+                    (age_us_since_last > STALE_MULT * dt_us_between_ticks) ||
+                    (age_us_since_last > STALE_ABS_US);
+
+        float instantaneous_tps = 0.0f;
+        if (!stale) {
+            instantaneous_tps = (float)position_delta * 1e6f / (float)dt_us_between_ticks; // ticks/s (signed)
+        }
+
+        // --- single-pole IIR on ticks/s, updated every loop ---
+        float filter_coeff  = (float)context.mem.driver_state.filter * 0.01f; // e.g., 200 -> 2.0 s^-1
+        float alpha         = 1.0f - expf(-delta_s * filter_coeff);           // delta_s = loop Δt in seconds
+        if (alpha < 0.0f) alpha = 0.0f;
+        if (alpha > 1.0f) alpha = 1.0f;
+
+        // Always update the filter; instantaneous_tps will be 0 when stale,
+        // so the estimate decays smoothly toward 0 at the chosen time constant.
+        tps_expo_avg = instantaneous_tps * alpha + tps_expo_avg * (1.0f - alpha);
+
+        // Publish for I2C (x100 fixed-point)
+        context.mem.driver_state.tps = (int32_t)(tps_expo_avg * 100.0f);
+
 
         if (context.mem.driver_state.current_ma > context.mem.driver_state.current_limit_ma) {
             context.mem.driver_state.throttle_limit = MIN(abs(context.mem.driver_state.throttle), context.mem.driver_state.throttle_limit * 0.999f);
@@ -598,7 +627,7 @@ int main() {
             // printf("position %lld %lld %lld\n", motor_positions[0].position, motor_positions[1].position,  motor_positions[2].position);
 
             // printf("loop rate %fhz\n", 1000000.0 / delta);
-            next_report = now + 0.5e6;
+            next_report = now + 0.1e6;
         }
         
 
