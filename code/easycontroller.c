@@ -54,17 +54,25 @@ const uint HALL_OVERSAMPLE = 64;
 
 const int DUTY_CYCLE_MAX = 65535;
 // 100mV / Amp sensor with a 2/3 voltage divider (15 amp / volt)
-const int CURRENT_SCALING = 3.3 / 4096 * ( -10 * 3 / 2 ) * 1000; 
-const int VOLTAGE_SCALING = 3.3 / 4096 * (47 + 2.2) / 2.2 * 1000;
+const float CURRENT_SCALING = (3.3f / 4096.0f) * (-10.0f * 3.0f / 2.0f) * 1000.0f; 
+const float VOLTAGE_SCALING = (3.3f / 4096.0f) * ((47.0f + 2.2f) / 2.2f) * 1000.0f;
+
 const int ADC_BIAS_OVERSAMPLE = 1000;
+
+const float SLEW_UP_PER_S   = 600.0f;   // gentle recovery
+const float SLEW_DOWN_PER_S = 4000.0f;  // faster back-off
+const float OVER_HI         = 1.10f;    // back off when >110% of limit
+const float UNDER_LO        = 0.95f;    // allow recovery when <95%
+
+const float Ts      = 1.0f / F_PWM;
+const float TAU_AVG = 0.050f;          // 50 ms effective averaging
+const float ALPHA   = Ts / TAU_AVG;    // ~0.001 at 10 kHz
 
 const int HALL_IDENTIFY_DUTY_CYCLE = 10;
 
 int adc_isense = 0;
 int adc_vsense = 0;
 int adc_throttle = 0;
-int64_t adc_isense_sum = 0;
-uint16_t adc_isense_count = 0;
 
 int adc_bias = 0;
 int duty_cycle = 0;
@@ -205,21 +213,12 @@ void on_adc_fifo() {
         return;
     }
 
-    
-
     voltage_mv = (int)(adc_vsense) * VOLTAGE_SCALING;
-    current_ma = ((int)(adc_isense) - adc_bias);
+    current_ma = ((int)(adc_isense) - adc_bias) * CURRENT_SCALING;
 
     context.mem.driver_state.voltage_mv = voltage_mv;
+    context.mem.driver_state.current_ma += ALPHA * (current_ma - context.mem.driver_state.current_ma);
 
-    // The current adc is noisy, so we average over 100ms
-    adc_isense_sum += adc_isense - adc_bias;
-    adc_isense_count++;
-    if (adc_isense_count > (F_PWM / 10)) { // Average over 100ms
-        context.mem.driver_state.current_ma = adc_isense_sum / adc_isense_count * CURRENT_SCALING; 
-        adc_isense_sum = 0;
-        adc_isense_count = 0;
-    }
 
     hall = get_halls();                 // Read the hall sensors
     int newMotor = hallToMotor[hall];     // Convert the current hall reading to the desired motor state
@@ -571,12 +570,15 @@ int main() {
         // Publish for I2C (x100 fixed-point)
         context.mem.driver_state.tps = (int32_t)(tps_expo_avg * 100.0f);
 
-
-        if (context.mem.driver_state.current_ma > context.mem.driver_state.current_limit_ma) {
-            context.mem.driver_state.throttle_limit = MIN(abs(context.mem.driver_state.throttle), context.mem.driver_state.throttle_limit * 0.999f);
-        } else if (context.mem.driver_state.throttle_limit < 255) {
-            context.mem.driver_state.throttle_limit += 0.1;
+        
+        if (context.mem.driver_state.current_ma  > OVER_HI * context.mem.driver_state.current_limit_ma) {
+            context.mem.driver_state.throttle_limit -= SLEW_DOWN_PER_S * delta_s;
+        } else if (context.mem.driver_state.current_ma < UNDER_LO * context.mem.driver_state.current_limit_ma && context.mem.driver_state.throttle_limit < 255.0f) {
+            context.mem.driver_state.throttle_limit += SLEW_UP_PER_S * delta_s;
         }
+
+        if (context.mem.driver_state.throttle_limit < 0.0f)   context.mem.driver_state.throttle_limit = 0.0f;
+        if (context.mem.driver_state.throttle_limit > 255.0f) context.mem.driver_state.throttle_limit = 255.0f;
 
         if (context.mem.driver_state.throttle > context.mem.driver_state.slewed_throttle) {
             context.mem.driver_state.slewed_throttle += 0.1;
