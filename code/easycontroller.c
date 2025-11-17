@@ -11,7 +11,7 @@
 #include "hardware/sync.h"
 #include "hardware/uart.h"
 
-#define VERSION 3
+#define VERSION 4
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
 #define AIRCR_Register (*((volatile uint32_t*)(PPB_BASE + 0x0ED0C)))
@@ -72,7 +72,8 @@ const int HALL_IDENTIFY_DUTY_CYCLE = 10;
 
 int adc_isense = 0;
 int adc_vsense = 0;
-int adc_throttle = 0;
+int adc_temp = 0;
+float avg_temp_c = 0.0f;
 
 int adc_bias = 0;
 int duty_cycle = 0;
@@ -108,6 +109,7 @@ typedef struct {
     int32_t current_limit_ma;
     float throttle_limit;      // controllers calculated limit to manage over current
     float slewed_throttle;
+    int16_t temp;
 } __attribute__((packed)) driver_state_t;
 
 static struct
@@ -203,7 +205,7 @@ void on_adc_fifo() {
     fifo_level = adc_fifo_get_level();
     adc_isense = adc_fifo_get();    // Read the ADC values into the registers
     adc_vsense = adc_fifo_get();
-    adc_throttle = adc_fifo_get();
+    adc_temp = adc_fifo_get(); // Convert ADC reading to degrees C
 
     restore_interrupts(flags);      // Re-enable interrupts
 
@@ -219,6 +221,9 @@ void on_adc_fifo() {
     context.mem.driver_state.voltage_mv = voltage_mv;
     context.mem.driver_state.current_ma += ALPHA * (current_ma - context.mem.driver_state.current_ma);
 
+    float temp_c = (3.3f * (float)adc_temp / 4096.0f - 0.5f) / 0.01f;
+    avg_temp_c += 0.01 * (temp_c - avg_temp_c);
+    context.mem.driver_state.temp = avg_temp_c*100;
 
     hall = get_halls();                 // Read the hall sensors
     int newMotor = hallToMotor[hall];     // Convert the current hall reading to the desired motor state
@@ -612,6 +617,7 @@ int main() {
             printf("Position %d\n", (int32_t)context.mem.driver_state.position);
             printf("voltage (mv) %d\n", context.mem.driver_state.voltage_mv);
             printf("current (ma) %d\n", context.mem.driver_state.current_ma);
+            printf("temp (C) %f\n", context.mem.driver_state.temp / 100.0f);
             // printf("adc bias %d\n", adc_bias);
             printf("throttle %d\n", context.mem.driver_state.throttle);
             // printf("brake %d\n", context.mem.driver_state.brake);
