@@ -143,22 +143,23 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
             // writes always start with the memory address
             context.mem_address = i2c_read_byte_raw(i2c);
             context.mem_address_written = true;
-            //printf("mem_address: %d\n", context.mem_address);
         } else {
-            // save into memory
-            context.mem.bytes[context.mem_address] = i2c_read_byte_raw(i2c);
-            //printf("master wrote: %d\n", context.mem.bytes[context.mem_address]);
-            context.mem_address++;
+            // save into memory only if address is within bounds
+            if (context.mem_address < sizeof(driver_state_t)) {
+                context.mem.bytes[context.mem_address] = i2c_read_byte_raw(i2c);
+                context.mem_address++;
+            } else {
+                // Read and discard the byte if address is out of bounds
+                i2c_read_byte_raw(i2c);
+            }
         }
         break;
     case I2C_SLAVE_REQUEST: // master is requesting data
         // load from memory
-        //printf("master read: %d\n", context.mem.bytes[context.mem_address]);
         i2c_write_byte_raw(i2c, context.mem.bytes[context.mem_address]);
         context.mem_address++;
         break;
     case I2C_SLAVE_FINISH: // master has signalled Stop / Restart
-        //printf("I2C_SLAVE_FINISH\n");
         context.mem_address_written = false;
         break;
     default:
