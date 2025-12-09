@@ -10,6 +10,7 @@
 #include "hardware/gpio.h"
 #include "hardware/sync.h"
 #include "hardware/uart.h"
+#include "hardware/watchdog.h"
 
 #define VERSION 4
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
@@ -527,7 +528,10 @@ int main() {
     context.mem.driver_state.current_limit_ma = 5000; // Set a default current limit of 5A
     context.mem.driver_state.throttle_limit   = 255;
 
+    watchdog_enable(10, true);
+
     while (true) { 
+        watchdog_update();
         if (context.mem.driver_state.reset > 0) {
             AIRCR_Register = 0x5FA0004;
         }
@@ -585,6 +589,10 @@ int main() {
         if (context.mem.driver_state.throttle_limit < 0.0f)   context.mem.driver_state.throttle_limit = 0.0f;
         if (context.mem.driver_state.throttle_limit > 255.0f) context.mem.driver_state.throttle_limit = 255.0f;
 
+        if (avg_temp_c > 80.0f) {
+            context.mem.driver_state.throttle = 0;
+        }
+
         if (context.mem.driver_state.throttle > context.mem.driver_state.slewed_throttle) {
             context.mem.driver_state.slewed_throttle += 0.1;
         } else {
@@ -593,7 +601,7 @@ int main() {
 
         last_time = now;
         // last_i2c_time = now;
-        if (abs(absolute_time_diff_us(last_i2c_time, now)) > 600e6) // If the I2C master hasn't communicated in 10mins, reset the controller
+        if (abs(absolute_time_diff_us(last_i2c_time, now)) > 10e6) // If the I2C master hasn't communicated in 10sec, reset the controller
         {
             context.mem.driver_state.reset = 1;
         } else if (abs(absolute_time_diff_us(last_i2c_time, now)) > 100000) // If the I2C master hasn't communicated in 100ms, stop the motor
