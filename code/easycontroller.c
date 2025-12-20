@@ -50,7 +50,6 @@ const uint B_PWM_SLICE = 1;
 const uint C_PWM_SLICE = 2;
 
 const uint F_PWM = 2000;   // Desired PWM frequency
-const uint FLAG_PIN = 2;
 const uint HALL_OVERSAMPLE = 64;
 
 const int DUTY_CYCLE_MAX = 65535;
@@ -202,7 +201,6 @@ void on_adc_fifo() {
     uint32_t flags = save_and_disable_interrupts(); // Disable interrupts for the time-critical reading ADC section. USB interrupts may interfere
 
     adc_run(false);             // Stop the ADC from free running
-    gpio_put(FLAG_PIN, 1);      // For debugging, toggle the flag pin
 
     fifo_level = adc_fifo_get_level();
     adc_isense = adc_fifo_get();    // Read the ADC values into the registers
@@ -263,7 +261,6 @@ void on_adc_fifo() {
     }
     
 
-    gpio_put(FLAG_PIN, 0);
 }
 
 void on_pwm_wrap() {
@@ -272,14 +269,12 @@ void on_pwm_wrap() {
     // to read current, based on where the current sensor is placed in the schematic.
     // Takes ~1.3 microseconds
 
-    gpio_put(FLAG_PIN, 1);      // Toggle the flag pin high for debugging
     adc_select_input(0);        // Force the ADC to start with input 0
     adc_run(true);              // Start the ADC
     pwm_clear_irq(A_PWM_SLICE); // Clear this interrupt flag
     while(!adc_fifo_is_empty()) // Clear out the ADC fifo, in case it still has samples in it
         adc_fifo_get();
 
-    gpio_put(FLAG_PIN, 0);
 }
 
 void writePhases(uint ah, uint bh, uint ch, uint al, uint bl, uint cl)
@@ -340,8 +335,6 @@ void init_hardware() {
 
     gpio_init(LED_PIN);     // Set LED and FLAG pin as outputs
     gpio_set_dir(LED_PIN, GPIO_OUT);
-    gpio_init(FLAG_PIN);
-    gpio_set_dir(FLAG_PIN, GPIO_OUT);
 
     gpio_init(HALL_1_PIN);  // Set up hall sensor pins
     gpio_set_dir(HALL_1_PIN, GPIO_IN);
