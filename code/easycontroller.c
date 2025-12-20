@@ -17,6 +17,8 @@
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
 #define AIRCR_Register (*((volatile uint32_t*)(PPB_BASE + 0x0ED0C)))
 
+#define DEBUG_OUTPUT false
+
 // Begin user config section ---------------------------
 
 const bool IDENTIFY_HALLS_ON_BOOT = false;   // If true, controller will initialize the hall table by slowly spinning the motor
@@ -614,7 +616,7 @@ int main() {
 
 
 
-        if (next_report < now) {
+        if (next_report < now  && DEBUG_OUTPUT) {
             //printf("i2c slave addr %d\n", i2c_slave_addr);
             // printf("P%d, T%d, E%.2f, T%d, DT%d, BH%d\n", (int32_t)context.mem.driver_state.position, (int32_t)(target_position/1024), error, throttle, (uint32_t)delta, context.mem.driver_state.bad_halls);
 
