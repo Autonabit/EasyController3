@@ -154,9 +154,13 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
         }
         break;
     case I2C_SLAVE_REQUEST: // master is requesting data
-        // load from memory
-        i2c_write_byte_raw(i2c, context.mem.bytes[context.mem_address]);
-        context.mem_address++;
+        // load from memory, return 0x00 when out of bounds
+        if (context.mem_address < sizeof(driver_state_t)) {
+            i2c_write_byte_raw(i2c, context.mem.bytes[context.mem_address]);
+            context.mem_address++;
+        } else {
+            i2c_write_byte_raw(i2c, 0x00);
+        }
         break;
     case I2C_SLAVE_FINISH: // master has signalled Stop / Restart
         context.mem_address_written = false;
