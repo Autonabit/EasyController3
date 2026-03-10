@@ -12,7 +12,7 @@
 #include "hardware/uart.h"
 #include "hardware/watchdog.h"
 
-#define VERSION 4
+#define VERSION 5
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
 #define AIRCR_Register (*((volatile uint32_t*)(PPB_BASE + 0x0ED0C)))
