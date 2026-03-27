@@ -2,6 +2,7 @@
 #include <math.h>
 #include "pico/stdlib.h"
 #include "pico/i2c_slave.h"
+#include "pico/bootrom.h"
 #include "hardware/i2c.h"
 #include "hardware/pwm.h"
 #include "hardware/clocks.h"
@@ -17,7 +18,7 @@
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
 #define AIRCR_Register (*((volatile uint32_t*)(PPB_BASE + 0x0ED0C)))
 
-#define DEBUG_OUTPUT false
+#define DEBUG_OUTPUT true
 
 // Begin user config section ---------------------------
 
@@ -25,8 +26,8 @@ const bool IDENTIFY_HALLS_ON_BOOT = false;   // If true, controller will initial
 const bool IDENTIFY_HALLS_REVERSE = false;  // If true, will initialize the hall table to spin the motor backwards
 
 // uint8_t hallToMotor[8] = {255, 255, 255, 255, 255, 255, 255, 255};  // Default hall table. Overwrite this with the output of the hall auto-identification 
-uint8_t hallToMotor[8] = {255, 4, 0, 5, 2, 3, 1, 255};  // Example hall table
-// uint8_t hallToMotor[8] = {255, 1, 3, 2, 5, 0, 4, 255,}; 
+// uint8_t hallToMotor[8] = {255, 4, 0, 5, 2, 3, 1, 255};  // Robot
+uint8_t hallToMotor[8] = {255, 1, 3, 2, 5, 0, 4, 255,};  //Mower
 
 
 const int MAX_MOTOR_CMD = 128;
@@ -51,7 +52,7 @@ const uint A_PWM_SLICE = 0;
 const uint B_PWM_SLICE = 1;
 const uint C_PWM_SLICE = 2;
 
-const uint F_PWM = 2000;   // Desired PWM frequency
+const uint F_PWM = 12000;   // Desired PWM frequency
 const uint HALL_OVERSAMPLE = 64;
 
 const int DUTY_CYCLE_MAX = 65535;
@@ -60,6 +61,8 @@ const float CURRENT_SCALING = (3.3f / 4096.0f) * (-10.0f * 3.0f / 2.0f) * 1000.0
 const float VOLTAGE_SCALING = (3.3f / 4096.0f) * ((47.0f + 2.2f) / 2.2f) * 1000.0f;
 
 const int ADC_BIAS_OVERSAMPLE = 1000;
+
+const float THROTTLE_SLEW_RATE = 32.0f;
 
 const float SLEW_UP_PER_S   = 600.0f;   // gentle recovery
 const float SLEW_DOWN_PER_S = 4000.0f;  // faster back-off
@@ -524,8 +527,8 @@ int main() {
     float tps_expo_avg = 0.0;
     context.mem.driver_state.filter           = 1500;
     context.mem.driver_state.brake            = 0;
-    context.mem.driver_state.throttle         = 0;
-    context.mem.driver_state.current_limit_ma = 5000; // Set a default current limit of 5A
+    context.mem.driver_state.throttle         = 200;
+    context.mem.driver_state.current_limit_ma = 10000; // Set a default current limit of 10A
     context.mem.driver_state.throttle_limit   = 255;
 
     watchdog_enable(10, true);
@@ -591,28 +594,40 @@ int main() {
 
         if (avg_temp_c > 80.0f) {
             context.mem.driver_state.throttle = 0;
+        } else if (context.mem.driver_state.voltage_mv < 48000) {
+            context.mem.driver_state.throttle = 0;
+        } else {
+            context.mem.driver_state.throttle = 200;
         }
 
-        if (context.mem.driver_state.throttle > context.mem.driver_state.slewed_throttle) {
-            context.mem.driver_state.slewed_throttle += 0.1;
-        } else {
-            context.mem.driver_state.slewed_throttle -= 0.1;
+
+        float target = (float)context.mem.driver_state.throttle;
+        float error = target - tps_expo_avg;
+        float rate = MAX( MIN((error) / 100.0f, 1.0f), -1.0f);
+
+        if (error > 50.0f || error < -50.0f) {
+            context.mem.driver_state.slewed_throttle += rate * THROTTLE_SLEW_RATE * delta_s;
         }
 
         last_time = now;
+
+        // if (abs(absolute_time_diff_us(last_i2c_time, now)) > 30e6) {
+        //     reset_usb_boot(0, 0);
+        // }
+
         // last_i2c_time = now;
-        if (abs(absolute_time_diff_us(last_i2c_time, now)) > 10e6) // If the I2C master hasn't communicated in 10sec, reset the controller
-        {
-            context.mem.driver_state.reset = 1;
-        } else if (abs(absolute_time_diff_us(last_i2c_time, now)) > 100000) // If the I2C master hasn't communicated in 100ms, stop the motor
-        {
-            context.mem.driver_state.throttle = 0;
-            context.mem.driver_state.brake = 0; //abs((int)tps_expo_avg*2) < 255 ? abs((int)tps_expo_avg*2) : 255;
-            gpio_put(LED_PIN, false);
-            // in future we probably want to apply 100% brake. For now we will do this as there is no way of pushing the robot while the escs are powered.
-        } else {
-            gpio_put(LED_PIN, true);
-        }
+        // if (abs(absolute_time_diff_us(last_i2c_time, now)) > 10e6) // If the I2C master hasn't communicated in 10sec, reset the controller
+        // {
+        //     context.mem.driver_state.reset = 1;
+        // } else if (abs(absolute_time_diff_us(last_i2c_time, now)) > 100000) // If the I2C master hasn't communicated in 100ms, stop the motor
+        // {
+        //     context.mem.driver_state.throttle = 0;
+        //     context.mem.driver_state.brake = 0; //abs((int)tps_expo_avg*2) < 255 ? abs((int)tps_expo_avg*2) : 255;
+        //     gpio_put(LED_PIN, false);
+        //     // in future we probably want to apply 100% brake. For now we will do this as there is no way of pushing the robot while the escs are powered.
+        // } else {
+        //     gpio_put(LED_PIN, true);
+        // }
 
 
 
@@ -620,7 +635,7 @@ int main() {
             //printf("i2c slave addr %d\n", i2c_slave_addr);
             // printf("P%d, T%d, E%.2f, T%d, DT%d, BH%d\n", (int32_t)context.mem.driver_state.position, (int32_t)(target_position/1024), error, throttle, (uint32_t)delta, context.mem.driver_state.bad_halls);
 
-            // printf("\n\n");
+            printf("\n\n");
             // printf("current time %lld\n", get_absolute_time());
             printf("Position %d\n", (int32_t)context.mem.driver_state.position);
             printf("voltage (mv) %d\n", context.mem.driver_state.voltage_mv);
@@ -643,7 +658,7 @@ int main() {
             // printf("position %lld %lld %lld\n", motor_positions[0].position, motor_positions[1].position,  motor_positions[2].position);
 
             // printf("loop rate %fhz\n", 1000000.0 / delta);
-            next_report = now + 0.1e6;
+            next_report = now + 0.5e6;
         }
         
 
