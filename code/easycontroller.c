@@ -51,7 +51,7 @@ const uint A_PWM_SLICE = 0;
 const uint B_PWM_SLICE = 1;
 const uint C_PWM_SLICE = 2;
 
-const uint F_PWM = 2000;   // Desired PWM frequency
+const uint F_PWM = 4000;   // Desired PWM frequency
 const uint HALL_OVERSAMPLE = 64;
 
 const int DUTY_CYCLE_MAX = 65535;
