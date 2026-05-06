@@ -177,7 +177,7 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
 
 static void setup_slave() {
     if (I2C_SLAVE_ADDRESS == 0xFF) {
-        i2c_slave_addr = 0x20 | gpio_get(ADDR_LOW_PIN) | gpio_get(ADDR_HIGH_PIN)<<1;
+        i2c_slave_addr = 0x30 | gpio_get(ADDR_LOW_PIN) | gpio_get(ADDR_HIGH_PIN)<<1;
     }else {
         i2c_slave_addr = I2C_SLAVE_ADDRESS;
     }
@@ -527,8 +527,8 @@ int main() {
     float tps_expo_avg = 0.0;
     context.mem.driver_state.filter           = 1500;
     context.mem.driver_state.brake            = 0;
-    context.mem.driver_state.throttle         = 200;
-    context.mem.driver_state.current_limit_ma = 10000; // Set a default current limit of 10A
+    context.mem.driver_state.throttle         = 0;
+    context.mem.driver_state.current_limit_ma = 22000; // Set a default current limit of 10A
     context.mem.driver_state.throttle_limit   = 255;
 
     watchdog_enable(10, true);
@@ -594,10 +594,8 @@ int main() {
 
         if (avg_temp_c > 80.0f) {
             context.mem.driver_state.throttle = 0;
-        } else if (context.mem.driver_state.voltage_mv < 48000) {
+        } else if (context.mem.driver_state.voltage_mv < 45000) {
             context.mem.driver_state.throttle = 0;
-        } else {
-            context.mem.driver_state.throttle = 200;
         }
 
 
@@ -608,6 +606,12 @@ int main() {
         if (error > 50.0f || error < -50.0f) {
             context.mem.driver_state.slewed_throttle += rate * THROTTLE_SLEW_RATE * delta_s;
         }
+        if (context.mem.driver_state.slewed_throttle > 255.0f) context.mem.driver_state.slewed_throttle = 255.0f;
+        if (context.mem.driver_state.slewed_throttle < -255.0f) context.mem.driver_state.slewed_throttle = -255.0f;
+
+        if (context.mem.driver_state.brake > 0) {
+            context.mem.driver_state.slewed_throttle = 0;
+        }
 
         last_time = now;
 
@@ -615,19 +619,19 @@ int main() {
         //     reset_usb_boot(0, 0);
         // }
 
-        // last_i2c_time = now;
-        // if (abs(absolute_time_diff_us(last_i2c_time, now)) > 10e6) // If the I2C master hasn't communicated in 10sec, reset the controller
-        // {
-        //     context.mem.driver_state.reset = 1;
-        // } else if (abs(absolute_time_diff_us(last_i2c_time, now)) > 100000) // If the I2C master hasn't communicated in 100ms, stop the motor
-        // {
-        //     context.mem.driver_state.throttle = 0;
-        //     context.mem.driver_state.brake = 0; //abs((int)tps_expo_avg*2) < 255 ? abs((int)tps_expo_avg*2) : 255;
-        //     gpio_put(LED_PIN, false);
-        //     // in future we probably want to apply 100% brake. For now we will do this as there is no way of pushing the robot while the escs are powered.
-        // } else {
-        //     gpio_put(LED_PIN, true);
-        // }
+        //last_i2c_time = now;
+        if (abs(absolute_time_diff_us(last_i2c_time, now)) > 10e6) // If the I2C master hasn't communicated in 10sec, reset the controller
+        {
+            context.mem.driver_state.reset = 1;
+        } else if (abs(absolute_time_diff_us(last_i2c_time, now)) > 100000) // If the I2C master hasn't communicated in 100ms, stop the motor
+        {
+            context.mem.driver_state.throttle = 0;
+            context.mem.driver_state.brake = 0; //abs((int)tps_expo_avg*2) < 255 ? abs((int)tps_expo_avg*2) : 255;
+            gpio_put(LED_PIN, false);
+            // in future we probably want to apply 100% brake. For now we will do this as there is no way of pushing the robot while the escs are powered.
+        } else {
+            gpio_put(LED_PIN, true);
+        }
 
 
 
@@ -641,6 +645,7 @@ int main() {
             printf("voltage (mv) %d\n", context.mem.driver_state.voltage_mv);
             printf("current (ma) %d\n", context.mem.driver_state.current_ma);
             printf("temp (C) %f\n", context.mem.driver_state.temp / 100.0f);
+            printf("Slewed %d\n", (int32_t)context.mem.driver_state.slewed_throttle);
             // printf("adc bias %d\n", adc_bias);
             printf("throttle %d\n", context.mem.driver_state.throttle);
             // printf("brake %d\n", context.mem.driver_state.brake);
