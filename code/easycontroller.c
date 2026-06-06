@@ -56,8 +56,8 @@ const uint F_PWM = 12000;   // Desired PWM frequency
 const uint HALL_OVERSAMPLE = 64;
 
 const int DUTY_CYCLE_MAX = 65535;
-// 100mV / Amp sensor with a 2/3 voltage divider (15 amp / volt)
-const float CURRENT_SCALING = (3.3f / 4096.0f) * (-10.0f * 3.0f / 2.0f) * 1000.0f; 
+// 66mV / Amp sensor with a 2/3 voltage divider (15 amp / volt)
+const float CURRENT_SCALING = (3.3f / 4096.0f) * (-15.15f * 3.0f / 2.0f) * 1000.0f; 
 const float VOLTAGE_SCALING = (3.3f / 4096.0f) * ((47.0f + 2.2f) / 2.2f) * 1000.0f;
 
 const int ADC_BIAS_OVERSAMPLE = 1000;
@@ -528,7 +528,7 @@ int main() {
     context.mem.driver_state.filter           = 1500;
     context.mem.driver_state.brake            = 0;
     context.mem.driver_state.throttle         = 0;
-    context.mem.driver_state.current_limit_ma = 22000; // Set a default current limit of 10A
+    context.mem.driver_state.current_limit_ma = 25000; // Set a default current limit of 25A
     context.mem.driver_state.throttle_limit   = 255;
 
     watchdog_enable(10, true);
