@@ -18,7 +18,7 @@
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
 #define AIRCR_Register (*((volatile uint32_t*)(PPB_BASE + 0x0ED0C)))
 
-#define DEBUG_OUTPUT true
+#define DEBUG_OUTPUT false
 
 // Begin user config section ---------------------------
 
