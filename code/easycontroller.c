@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "pico/i2c_slave.h"
 #include "pico/bootrom.h"
@@ -66,8 +67,8 @@ const float THROTTLE_SLEW_RATE = 32.0f;
 
 const float SLEW_UP_PER_S   = 600.0f;   // gentle recovery
 const float SLEW_DOWN_PER_S = 4000.0f;  // faster back-off
-const float OVER_HI         = 1.10f;    // back off when >110% of limit
-const float UNDER_LO        = 0.95f;    // allow recovery when <95%
+const float OVER_HI         = 1.0f;    // back off when >100% of limit
+const float UNDER_LO        = 0.90f;    // allow recovery when <95%
 
 const float Ts      = 1.0f / F_PWM;
 const float TAU_AVG = 0.050f;          // 50 ms effective averaging
@@ -127,6 +128,8 @@ static struct
     bool mem_address_written;
 } context;
 
+static uint8_t i2c_tx_bytes[sizeof(driver_state_t)];
+
 typedef struct
 {
     int64_t position;
@@ -146,6 +149,7 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
         if (!context.mem_address_written) {
             // writes always start with the memory address
             context.mem_address = i2c_read_byte_raw(i2c);
+            memcpy(i2c_tx_bytes, context.mem.bytes, sizeof(driver_state_t));
             context.mem_address_written = true;
         } else {
             // save into memory only if address is within bounds
@@ -161,7 +165,7 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
     case I2C_SLAVE_REQUEST: // master is requesting data
         // load from memory, return 0x00 when out of bounds
         if (context.mem_address < sizeof(driver_state_t)) {
-            i2c_write_byte_raw(i2c, context.mem.bytes[context.mem_address]);
+            i2c_write_byte_raw(i2c, i2c_tx_bytes[context.mem_address]);
             context.mem_address++;
         } else {
             i2c_write_byte_raw(i2c, 0x00);
@@ -603,7 +607,10 @@ int main() {
         float error = target - tps_expo_avg;
         float rate = MAX( MIN((error) / 100.0f, 1.0f), -1.0f);
 
-        if (error > 50.0f || error < -50.0f) {
+        if (fabsf(target) < 1.0f && fabsf(context.mem.driver_state.slewed_throttle) < 1.0f) {
+            context.mem.driver_state.slewed_throttle = 0;
+            error = 0;
+        } else if (fabsf(error) > 50.0f || fabsf(target) < 1.0f) {
             context.mem.driver_state.slewed_throttle += rate * THROTTLE_SLEW_RATE * delta_s;
         }
         if (context.mem.driver_state.slewed_throttle > 255.0f) context.mem.driver_state.slewed_throttle = 255.0f;
