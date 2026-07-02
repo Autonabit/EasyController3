@@ -140,6 +140,7 @@ motor_position_t motor_positions[2];
 
 uint get_halls();
 void writePWM(uint motorState, uint duty, bool synchronous);
+void writeBrakePWM(uint duty);
 uint8_t read_throttle();
 
 static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
@@ -260,14 +261,14 @@ void on_adc_fifo() {
    
     motorState = newMotor;
     if (context.mem.driver_state.brake > 0) {
-        writePWM(7, context.mem.driver_state.brake, true);
+        writeBrakePWM(context.mem.driver_state.brake);
     } else {
         duty_cycle = abs((int)context.mem.driver_state.slewed_throttle);
         if (duty_cycle > context.mem.driver_state.throttle_limit) {
             duty_cycle = context.mem.driver_state.throttle_limit; // Clamp the duty cycle to the throttle limit
         }
         uint8_t driveState = motorState;
-        if (context.mem.driver_state.slewed_throttle < 0)
+        if (context.mem.driver_state.slewed_throttle < 0 && motorState < 6)
             driveState = (motorState + 3) % 6;  // If throttle is negative, reverse the motor direction
         
         writePWM(driveState, (uint)(duty_cycle), true);
@@ -305,12 +306,14 @@ void writePhases(uint ah, uint bh, uint ch, uint al, uint bl, uint cl)
 void writePWM(uint motorState, uint duty, bool synchronous)
 {
     // Switch the transistors given a desired electrical state and duty cycle
-    // motorState: desired electrical position, range of 0-5
+    // motorState: desired electrical position, range of 0-5. Any other value (e.g. an invalid
+    //             hall reading) is treated as unknown rotor position, and all transistors are
+    //             turned off rather than guessing - braking against a bad hall reading is not safe.
     // duty: desired duty cycle, range of 0-255
-    // synchronous: perfom synchronous (low-side and high-side alternating) or non-synchronous switching (high-side only) 
+    // synchronous: perfom synchronous (low-side and high-side alternating) or non-synchronous switching (high-side only)
 
-    if(duty == 0 || duty > 255)     // If zero throttle, turn both low-sides and high-sides off
-        motorState = 255;
+    if(duty > 255)     // Invalid duty, treat as zero throttle rather than clamping to full duty
+        duty = 0;
 
     // At near 100% duty cycles, the gate driver bootstrap capacitor may become discharged as the high-side gate is repeatedly driven
     // high and low without time for the phase voltage to fall to zero and charge the bootstrap capacitor. Thus, if duty cycle is near
@@ -336,9 +339,19 @@ void writePWM(uint motorState, uint duty, bool synchronous)
         writePhases(duty, 0, 0, complement, 0, 255);
     else if(motorState == 5)                    // LOW C, HIGH B
         writePhases(0, duty, 0, 0, complement, 255);
-    else                                        // All transistors off
-        //writePhases(0, 0, 0, 255, 255, 255);
-        writePhases(0, 0, 0, duty, duty, duty);
+    else                                        // Invalid motor state - all transistors off
+        writePhases(0, 0, 0, 0, 0, 0);
+}
+
+void writeBrakePWM(uint duty)
+{
+    // Applies a proportional 3-phase brake by turning on all three low-side transistors together.
+    // duty: desired brake strength, range of 0-255 (0 = no brake, 255 = full brake)
+
+    if(duty > 255)
+        duty = 255;
+
+    writePhases(0, 0, 0, duty, duty, duty);
 }
 
 void init_hardware() {
@@ -455,7 +468,7 @@ void identify_halls()
             hallToMotor[get_halls()] = (i + 2) % 6;     // If the motor should spin forwards, save a motor state of +1.5 steps
     }
 
-    writePWM(0, 0, false);      // Turn phases off
+    writePWM(255, 0, false);      // Turn phases off
 
     printf("hallToMotor array:\n");     // Print out the array
     for(uint8_t i = 0; i < 8; i++)
