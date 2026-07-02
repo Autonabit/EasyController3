@@ -71,8 +71,8 @@ const float OVER_HI         = 1.0f;    // back off when >100% of limit
 const float UNDER_LO        = 0.90f;    // allow recovery when <95%
 
 const float Ts      = 1.0f / F_PWM;
-const float TAU_AVG = 0.050f;          // 50 ms effective averaging
-const float ALPHA   = Ts / TAU_AVG;    // ~0.001 at 10 kHz
+const float TAU_AVG = 0.003f;          // 3 ms effective averaging
+const float ALPHA   = Ts / TAU_AVG;    // ~0.028 at 12 kHz
 
 const int HALL_IDENTIFY_DUTY_CYCLE = 10;
 
