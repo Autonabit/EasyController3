@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include <string.h>
 #include "pico/stdlib.h"
@@ -15,11 +16,9 @@
 #include "hardware/watchdog.h"
 
 #define VERSION 5
-#define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
-#define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
-#define AIRCR_Register (*((volatile uint32_t*)(PPB_BASE + 0x0ED0C)))
 
 #define DEBUG_OUTPUT false
+#define DISABLE_I2C_TIMEOUT false
 
 // Begin user config section ---------------------------
 
@@ -89,6 +88,7 @@ int hall = 0;
 uint motorState = 0;
 int fifo_level = 0;
 uint64_t ticks_since_init = 0;
+volatile uint32_t commutation_count = 0;    // Successful on_adc_fifo passes; the main loop only pets the watchdog when this advances
 
 const uint ADDR_LOW_PIN = 4;
 const uint ADDR_HIGH_PIN = 5;
@@ -273,8 +273,11 @@ void on_adc_fifo() {
         
         writePWM(driveState, (uint)(duty_cycle), true);
     }
-    
 
+    // Count only passes that reached a gate write: the early return above must
+    // not count, so a handler that fires but never updates the bridge still
+    // trips the watchdog.
+    commutation_count++;
 }
 
 void on_pwm_wrap() {
@@ -374,13 +377,6 @@ void init_hardware() {
     gpio_init(ADDR_HIGH_PIN);
     gpio_set_dir(ADDR_HIGH_PIN, GPIO_IN);
 
-    gpio_set_function(AH_PIN, GPIO_FUNC_PWM);   // Set gate control pins as output
-    gpio_set_function(AL_PIN, GPIO_FUNC_PWM);
-    gpio_set_function(BH_PIN, GPIO_FUNC_PWM);
-    gpio_set_function(BL_PIN, GPIO_FUNC_PWM);
-    gpio_set_function(CH_PIN, GPIO_FUNC_PWM);
-    gpio_set_function(CL_PIN, GPIO_FUNC_PWM);
-
     adc_init();
     adc_gpio_init(ISENSE_PIN);  // Set up ADC pins
     adc_gpio_init(VSENSE_PIN);
@@ -414,11 +410,22 @@ void init_hardware() {
     pwm_config_set_phase_correct(&config, true);    // Set phase correct (counts up then down). This is allows firing the interrupt in the middle of the PWM cycle
     pwm_config_set_output_polarity(&config, false, true);   // Invert the lowside PWM such that 0 corresponds to lowside transistors on
 
-    writePhases(0, 0, 0, 0, 0, 0);  // Initialize all the PWMs to be off
-
     pwm_init(A_PWM_SLICE, &config, false);
     pwm_init(B_PWM_SLICE, &config, false);
     pwm_init(C_PWM_SLICE, &config, false);
+
+    // pwm_init() resets the compare levels to 0, which with the inverted low-side
+    // polarity means all three low-side gates driven on (a 3-phase brake). The
+    // all-off levels must be written after pwm_init, and the gate pins must only
+    // be connected to the PWM peripheral once the levels are safe.
+    writePhases(0, 0, 0, 0, 0, 0);
+
+    gpio_set_function(AH_PIN, GPIO_FUNC_PWM);   // Set gate control pins as output
+    gpio_set_function(AL_PIN, GPIO_FUNC_PWM);
+    gpio_set_function(BH_PIN, GPIO_FUNC_PWM);
+    gpio_set_function(BL_PIN, GPIO_FUNC_PWM);
+    gpio_set_function(CH_PIN, GPIO_FUNC_PWM);
+    gpio_set_function(CL_PIN, GPIO_FUNC_PWM);
 
     pwm_set_mask_enabled(0x07); // Enable our three PWM timers
 }
@@ -549,11 +556,27 @@ int main() {
     context.mem.driver_state.throttle_limit   = 255;
 
     watchdog_enable(10, true);
+    uint32_t last_commutation_count = 0;
 
-    while (true) { 
-        watchdog_update();
+    while (true) {
+        // Pet the watchdog only if commutation has advanced since the last
+        // loop iteration. A stalled ADC/PWM interrupt chain would leave the
+        // last gate state latched on the bridge indefinitely; gating the pet
+        // on interrupt liveness turns that into a reset within 10ms.
+        uint32_t count = commutation_count;
+        if (count != last_commutation_count) {
+            watchdog_update();
+            last_commutation_count = count;
+        }
         if (context.mem.driver_state.reset > 0) {
-            AIRCR_Register = 0x5FA0004;
+            // Disarm the bridge before rebooting: stop the commutation interrupts
+            // so they can't rewrite the phases, then turn all gates off.
+            pwm_set_irq_enabled(A_PWM_SLICE, false);
+            irq_set_enabled(ADC_IRQ_FIFO, false);
+            writePhases(0, 0, 0, 0, 0, 0);
+            watchdog_reboot(0, 0, 0);
+            while (true)
+                tight_loop_contents();
         }
         absolute_time_t now = get_absolute_time();
         int64_t delta = absolute_time_diff_us(last_time, now);
@@ -639,11 +662,13 @@ int main() {
         //     reset_usb_boot(0, 0);
         // }
 
-        //last_i2c_time = now;
-        if (abs(absolute_time_diff_us(last_i2c_time, now)) > 10e6) // If the I2C master hasn't communicated in 10sec, reset the controller
+        #if DISABLE_I2C_TIMEOUT
+        last_i2c_time = now;
+        #endif
+        if (llabs(absolute_time_diff_us(last_i2c_time, now)) > 10e6) // If the I2C master hasn't communicated in 10sec, reset the controller
         {
             context.mem.driver_state.reset = 1;
-        } else if (abs(absolute_time_diff_us(last_i2c_time, now)) > 100000) // If the I2C master hasn't communicated in 100ms, stop the motor
+        } else if (llabs(absolute_time_diff_us(last_i2c_time, now)) > 100000) // If the I2C master hasn't communicated in 100ms, stop the motor
         {
             context.mem.driver_state.throttle = 0;
             context.mem.driver_state.brake = 0; //abs((int)tps_expo_avg*2) < 255 ? abs((int)tps_expo_avg*2) : 255;
