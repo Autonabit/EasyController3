@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "pico/i2c_slave.h"
+#include "pico/unique_id.h"
 #include "hardware/i2c.h"
 #include "hardware/pwm.h"
 #include "hardware/clocks.h"
@@ -12,9 +14,7 @@
 #include "hardware/uart.h"
 #include "hardware/watchdog.h"
 
-#define VERSION 5
-#define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
-#define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
+#define VERSION 7
 #define AIRCR_Register (*((volatile uint32_t*)(PPB_BASE + 0x0ED0C)))
 
 #define DEBUG_OUTPUT false
@@ -24,10 +24,11 @@
 const bool IDENTIFY_HALLS_ON_BOOT = false;   // If true, controller will initialize the hall table by slowly spinning the motor
 const bool IDENTIFY_HALLS_REVERSE = false;  // If true, will initialize the hall table to spin the motor backwards
 
-// uint8_t hallToMotor[8] = {255, 255, 255, 255, 255, 255, 255, 255};  // Default hall table. Overwrite this with the output of the hall auto-identification 
+// uint8_t hallToMotor[8] = {255, 255, 255, 255, 255, 255, 255, 255};  // Default hall table. Overwrite this with the output of the hall auto-identification
 uint8_t hallToMotor[8] = {255, 4, 0, 5, 2, 3, 1, 255};  // Example hall table
-// uint8_t hallToMotor[8] = {255, 1, 3, 2, 5, 0, 4, 255,}; 
+// uint8_t hallToMotor[8] = {255, 1, 3, 2, 5, 0, 4, 255,};
 
+#define CURRENT_SENSOR_30A true  // true for the 30A/66mV current sensor (all new motor drivers), false for the older 20A/100mV sensor
 
 const int MAX_MOTOR_CMD = 128;
 
@@ -51,15 +52,17 @@ const uint A_PWM_SLICE = 0;
 const uint B_PWM_SLICE = 1;
 const uint C_PWM_SLICE = 2;
 
-const uint F_PWM = 4000;   // Desired PWM frequency
+const uint F_PWM = 2000;   // Desired PWM frequency
 const uint HALL_OVERSAMPLE = 64;
 
 const int DUTY_CYCLE_MAX = 65535;
-// 100mV / Amp sensor with a 2/3 voltage divider (15 amp / volt)
-const float CURRENT_SCALING = (3.3f / 4096.0f) * (-10.0f * 3.0f / 2.0f) * 1000.0f; 
+// 30A sensor: 66mV / Amp (15.15 amp / volt). 20A sensor: 100mV / Amp (10 amp / volt). Both with a 2/3 voltage divider
+const float CURRENT_SCALING = (3.3f / 4096.0f) * ((CURRENT_SENSOR_30A ? -15.15f : -10.0f) * 3.0f / 2.0f) * 1000.0f;
 const float VOLTAGE_SCALING = (3.3f / 4096.0f) * ((47.0f + 2.2f) / 2.2f) * 1000.0f;
 
 const int ADC_BIAS_OVERSAMPLE = 1000;
+
+const float THROTTLE_SLEW_RATE = 512.0f;
 
 const float SLEW_UP_PER_S   = 600.0f;   // gentle recovery
 const float SLEW_DOWN_PER_S = 4000.0f;  // faster back-off
@@ -112,6 +115,7 @@ typedef struct {
     float throttle_limit;      // controllers calculated limit to manage over current
     float slewed_throttle;
     int16_t temp;
+    int8_t id[8];
 } __attribute__((packed)) driver_state_t;
 
 static struct
@@ -123,6 +127,8 @@ static struct
     uint8_t mem_address;
     bool mem_address_written;
 } context;
+
+static uint8_t i2c_tx_bytes[sizeof(driver_state_t)];
 
 typedef struct
 {
@@ -143,6 +149,7 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
         if (!context.mem_address_written) {
             // writes always start with the memory address
             context.mem_address = i2c_read_byte_raw(i2c);
+            memcpy(i2c_tx_bytes, context.mem.bytes, sizeof(driver_state_t));
             context.mem_address_written = true;
         } else {
             // save into memory only if address is within bounds
@@ -158,7 +165,7 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
     case I2C_SLAVE_REQUEST: // master is requesting data
         // load from memory, return 0x00 when out of bounds
         if (context.mem_address < sizeof(driver_state_t)) {
-            i2c_write_byte_raw(i2c, context.mem.bytes[context.mem_address]);
+            i2c_write_byte_raw(i2c, i2c_tx_bytes[context.mem_address]);
             context.mem_address++;
         } else {
             i2c_write_byte_raw(i2c, 0x00);
@@ -354,13 +361,6 @@ void init_hardware() {
     gpio_init(ADDR_HIGH_PIN);
     gpio_set_dir(ADDR_HIGH_PIN, GPIO_IN);
 
-    gpio_set_function(AH_PIN, GPIO_FUNC_PWM);   // Set gate control pins as output
-    gpio_set_function(AL_PIN, GPIO_FUNC_PWM);
-    gpio_set_function(BH_PIN, GPIO_FUNC_PWM);
-    gpio_set_function(BL_PIN, GPIO_FUNC_PWM);
-    gpio_set_function(CH_PIN, GPIO_FUNC_PWM);
-    gpio_set_function(CL_PIN, GPIO_FUNC_PWM);
-
     adc_init();
     adc_gpio_init(ISENSE_PIN);  // Set up ADC pins
     adc_gpio_init(VSENSE_PIN);
@@ -394,11 +394,22 @@ void init_hardware() {
     pwm_config_set_phase_correct(&config, true);    // Set phase correct (counts up then down). This is allows firing the interrupt in the middle of the PWM cycle
     pwm_config_set_output_polarity(&config, false, true);   // Invert the lowside PWM such that 0 corresponds to lowside transistors on
 
-    writePhases(0, 0, 0, 0, 0, 0);  // Initialize all the PWMs to be off
-
     pwm_init(A_PWM_SLICE, &config, false);
     pwm_init(B_PWM_SLICE, &config, false);
     pwm_init(C_PWM_SLICE, &config, false);
+
+    // pwm_init() resets the compare levels to 0, which with the inverted low-side
+    // polarity means all three low-side gates driven on (a 3-phase brake). The
+    // all-off levels must be written after pwm_init, and the gate pins must only
+    // be connected to the PWM peripheral once the levels are safe.
+    writePhases(0, 0, 0, 0, 0, 0);
+
+    gpio_set_function(AH_PIN, GPIO_FUNC_PWM);   // Set gate control pins as output
+    gpio_set_function(AL_PIN, GPIO_FUNC_PWM);
+    gpio_set_function(BH_PIN, GPIO_FUNC_PWM);
+    gpio_set_function(BL_PIN, GPIO_FUNC_PWM);
+    gpio_set_function(CH_PIN, GPIO_FUNC_PWM);
+    gpio_set_function(CL_PIN, GPIO_FUNC_PWM);
 
     pwm_set_mask_enabled(0x07); // Enable our three PWM timers
 }
@@ -481,6 +492,7 @@ void commutate_open_loop()
 
 int main() {
     context.mem.driver_state.version = VERSION;
+    pico_get_unique_board_id(&context.mem.driver_state.id);
 
     sleep_ms(500);
     init_hardware();
@@ -593,10 +605,22 @@ int main() {
             context.mem.driver_state.throttle = 0;
         }
 
-        if (context.mem.driver_state.throttle > context.mem.driver_state.slewed_throttle) {
-            context.mem.driver_state.slewed_throttle += 0.1;
-        } else {
-            context.mem.driver_state.slewed_throttle -= 0.1;
+        float target = (float)context.mem.driver_state.throttle;
+
+        if (fabsf(target) < 1.0f && fabsf(context.mem.driver_state.slewed_throttle) < 1.0f) {
+            context.mem.driver_state.slewed_throttle = 0;
+        } else if (context.mem.driver_state.slewed_throttle < target) {
+            context.mem.driver_state.slewed_throttle += THROTTLE_SLEW_RATE * delta_s;
+            if (context.mem.driver_state.slewed_throttle > target) context.mem.driver_state.slewed_throttle = target;
+        } else if (context.mem.driver_state.slewed_throttle > target) {
+            context.mem.driver_state.slewed_throttle -= THROTTLE_SLEW_RATE * delta_s;
+            if (context.mem.driver_state.slewed_throttle < target) context.mem.driver_state.slewed_throttle = target;
+        }
+        if (context.mem.driver_state.slewed_throttle > 255.0f) context.mem.driver_state.slewed_throttle = 255.0f;
+        if (context.mem.driver_state.slewed_throttle < -255.0f) context.mem.driver_state.slewed_throttle = -255.0f;
+
+        if (context.mem.driver_state.brake > 0) {
+            context.mem.driver_state.slewed_throttle = 0;
         }
 
         last_time = now;
